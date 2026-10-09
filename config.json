@@ -1,0 +1,22 @@
+{
+  "webhooker_url": "http://localhost:8080",
+  "bot_name": "mybot",
+  "api_key_file": "secrets/api_key",
+  "state_dir": "",
+  "desktop_notify": true,
+  "poll_interval_s": 1.5,
+  "wait_timeout_s": 600,
+  "password_ask_timeout_s": 180,
+  "command_timeout_s": 300,
+  "password_ttl_s": 300,
+  "max_output_chars": 20000,
+  "denylist": [
+    "mkfs",
+    "dd if=",
+    ":() {",
+    "rm -rf /",
+    "rm -rf /*",
+    "> /dev/sd",
+    "shred /dev/"
+  ]
+}
