@@ -16,19 +16,24 @@ How it works
 ------------
 1. The agent calls sudo_run with the command (argv list or shell string) and a reason.
 2. The server announces the request in the Matrix room (via MatrixWebhooker),
-   fires a desktop notification, and waits.
-3. The human replies "yes" / "no" (and "yes <password>" if a password is
-   needed) in Matrix — or approves/denies from any terminal with the CLI.
-4. Only on approval does the server run `sudo -n` (or `sudo -S` with the
-   provided password) and return stdout/stderr/exit code to the agent.
+   pops a local desktop dialog (zenity/kdialog) with Approve/Deny, and waits.
+3. The human replies "yes" / "no" in Matrix, clicks the desktop dialog, or
+   approves/denies from any terminal with the CLI.
+4. Passwords are entered LOCALLY only (desktop dialog or CLI getpass) — never
+   via Matrix, so they never reach the homeserver or the agent's context.
+5. Only on approval does the server run `sudo -n` (or `sudo -S` with the
+   locally-entered password) and return stdout/stderr/exit code to the agent.
+6. If no decision arrives within `remind_after_s` seconds, the server sends a
+   Matrix mention (push notification) and re-fires the desktop notification.
 
 Security model
 --------------
 - Every run requires an explicit human decision; nothing is auto-approved.
 - A `denylist` of substrings is refused immediately without asking.
-- Passwords are never written to disk (the decision file is deleted after
-  use and holds at most the just-provided password). History logs only
-  booleans like "password_provided".
+- Passwords never travel over Matrix: they are entered in the local desktop
+  dialog or via getpass in a terminal. They are never written to disk
+  (the decision file is deleted after use and holds at most the
+  just-entered password). History logs only booleans like "password_provided".
 - A password that was actually used may be kept in server memory for
   `password_ttl_s` seconds (0 = never cache).
 """
@@ -42,6 +47,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -57,8 +63,11 @@ DEFAULTS: dict = {
     "api_key_file": "secrets/api_key",
     "state_dir": "",  # default: ~/.local/state/interactivesudo
     "desktop_notify": True,
+    "desktop_gui": True,           # zenity/kdialog approve + password prompts
     "poll_interval_s": 1.5,
     "wait_timeout_s": 600,          # how long to wait for yes/no
+    "remind_after_s": 300,          # Matrix mention ping after this long (0 = off)
+    "remind_mxid": "",              # your MXID, mentioned so the ping pushes
     "password_ask_timeout_s": 180,  # how long to wait for a password
     "command_timeout_s": 300,       # max runtime of the sudo command itself
     "password_ttl_s": 300,          # in-memory cache of a working password
@@ -76,11 +85,11 @@ DEFAULTS: dict = {
 
 APPROVE_WORDS = {
     "yes", "y", "yep", "yeah", "ok", "okay", "approve", "approved", "go", "sure",
-    "ja", "bitte", "klar",
+    "ja", "bitte", "klar", "👍", "👍🏼", "👍🏽",
 }
 DENY_WORDS = {
     "no", "n", "nope", "deny", "denied", "abort", "cancel", "stop",
-    "nein", "abbrechen", "ablehnen", "ablehne",
+    "nein", "abbrechen", "ablehnen", "ablehne", "👎", "👎🏼", "👎🏽",
 }
 
 # ---------------------------------------------------------------------------
@@ -191,14 +200,14 @@ def resolve_request_id(cfg: dict, arg: str) -> str:
 
 
 def set_decision(cfg: dict, request_id: str, decision: str, password: str | None,
-                 actor: str) -> None:
+                 actor: str, source: str = "cli") -> None:
     _, req_root = state_paths(cfg)
     write_json(
         req_root / f"{request_id}" / "decision.json",
         {
             "decision": decision,
             "password": password,
-            "source": "cli",
+            "source": source,
             "actor": actor,
             "ts": utc_stamp(),
         },
@@ -299,27 +308,28 @@ def cmdline_of(argv: list[str]) -> str:
     return " ".join(argv)
 
 
-def parse_reply(raw: str) -> tuple[str | None, str | None]:
-    """Parse a human reply into (decision, password).
+def parse_reply(raw: str) -> tuple[str | None, bool]:
+    """Parse a human reply into (decision, had_extra_words).
 
     decision is "approve" | "deny" | None (not a decision).
+    Passwords are never accepted via Matrix; extra words after an approve
+    word are flagged so the caller can warn the user.
     """
     text = (raw or "").strip().strip("`").strip()
     if not text:
-        return None, None
+        return None, False
     words = [w.lower().rstrip("!.") for w in text.split()]
     first = words[0]
     if first in APPROVE_WORDS:
-        rest = text.split(None, 1)[1].strip() if len(text.split()) > 1 else None
-        return "approve", rest or None
+        return "approve", len(text.split()) > 1
     if first in DENY_WORDS:
-        return "deny", None
+        return "deny", False
     # Fallback: a decision keyword anywhere in the message.
     if any(w in APPROVE_WORDS for w in words):
-        return "approve", None
+        return "approve", False
     if any(w in DENY_WORDS for w in words):
-        return "deny", None
-    return None, None
+        return "deny", False
+    return None, False
 
 
 def desktop_notify(enabled: bool, title: str, body: str) -> None:
@@ -335,22 +345,133 @@ def desktop_notify(enabled: bool, title: str, body: str) -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# desktop GUI (local-only approvals and passwords)
+# ---------------------------------------------------------------------------
+
+_ACTIVE_DIALOGS: dict[str, subprocess.Popen] = {}
+
+
+def detect_gui_tool(cfg: dict) -> str | None:
+    """Pick zenity or kdialog when a desktop session is reachable."""
+    if not cfg.get("desktop_gui", True):
+        return None
+    if not (os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY")):
+        return None
+    desktop = os.environ.get("XDG_CURRENT_DESKTOP", "").upper()
+    candidates = ["kdialog", "zenity"] if "KDE" in desktop else ["zenity", "kdialog"]
+    for tool in candidates:
+        if shutil.which(tool):
+            return tool
+    return None
+
+
+def gui_prompt(cfg: dict, request_id: str, cmd_display: str, reason: str,
+               mode: str, deadline_monotonic: float) -> bool:
+    """Pop a local dialog in a background thread (mode: 'approve'|'password').
+
+    'approve': Approve/Deny question dialog; closing the window denies.
+    'password': password entry; Cancel/close does nothing (other channels
+    still work, and the request eventually expires).
+    Decisions go into the local decision file — never into Matrix.
+    Returns True if a dialog was actually launched.
+    """
+    tool = detect_gui_tool(cfg)
+    if not tool:
+        return False
+    actor = os.environ.get("USER", "desktop")
+    if mode == "approve":
+        text = (f"sudo request {request_id}\n\n"
+                f"Command:\n{cmd_display}\n\n"
+                f"Reason: {reason or '-'}\n\nApprove?")
+        if tool == "kdialog":
+            cmd = ["kdialog", "--title", "InteractiveSudo — approval needed",
+                   "--question", text]
+        else:
+            cmd = ["zenity", "--question",
+                   "--title", "InteractiveSudo — approval needed",
+                   "--width", "560", "--ok-label", "Approve",
+                   "--cancel-label", "Deny", "--text", text]
+    else:
+        prompt = (f"sudo {request_id} needs your password (entered locally, "
+                  f"never sent over Matrix):\n\n{cmd_display}")
+        if tool == "kdialog":
+            cmd = ["kdialog", "--title", "InteractiveSudo — password",
+                   "--password", prompt]
+        else:
+            cmd = ["zenity", "--password", "--title", "InteractiveSudo — password",
+                   "--text", prompt]
+
+    def run() -> None:
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL, text=True)
+        except Exception:
+            return
+        _ACTIVE_DIALOGS[request_id] = proc
+        remaining = max(1.0, deadline_monotonic - time.monotonic())
+        try:
+            out, _ = proc.communicate(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out = None
+        _ACTIVE_DIALOGS.pop(request_id, None)
+        if out is None:
+            return
+        rc = proc.returncode
+        if mode == "approve":
+            if rc == 0:
+                set_decision(cfg, request_id, "approve", None, actor, source="gui")
+            elif rc == 1:  # Deny clicked or window closed: fail closed
+                set_decision(cfg, request_id, "deny", None, actor, source="gui")
+            # other rc: the dialog tool itself failed; keep waiting
+        else:
+            pw = out.strip("\n")
+            if rc == 0 and pw:
+                set_decision(cfg, request_id, "approve", pw, actor, source="gui")
+            # Cancel/close: no decision, other channels still work
+
+    threading.Thread(target=run, daemon=True).start()
+    return True
+
+
+def kill_dialogs(*request_ids: str) -> None:
+    for rid in request_ids:
+        proc = _ACTIVE_DIALOGS.pop(rid, None)
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
 def wait_for_decision(cfg: dict, wh: Webhooker | None, room_id: str | None,
                       since_ts_ms: int, deadline_monotonic: float,
-                      request_id: str) -> dict | None:
-    """Poll for a decision: local decision file (CLI) or Matrix reply.
+                      request_id: str, require_password: bool = False,
+                      remind_at_monotonic: float | None = None,
+                      remind_cb=None) -> dict | None:
+    """Poll for a decision: local decision file (GUI/CLI) or Matrix reply.
 
+    Matrix is decision-only: passwords are never accepted from Matrix.
+    With require_password, approvals without a password (Matrix or GUI) are
+    ignored until a password arrives locally or the round times out.
+    remind_cb fires once when remind_at_monotonic is reached.
     Returns {"decision","password","source","actor"} or None on timeout.
     """
     _, req_root = state_paths(cfg)
     decision_file = req_root / request_id / "decision.json"
     interval = float(cfg["poll_interval_s"])
+    reminded = False
     while True:
         if decision_file.exists():
             d = read_json(decision_file)
             decision_file.unlink(missing_ok=True)
             if d:
-                return d
+                if (require_password and d.get("decision") == "approve"
+                        and not d.get("password")):
+                    pass  # approval without password: keep waiting for one
+                else:
+                    return d
         if wh is not None and room_id:
             try:
                 for m in wh.messages(room_id, limit=25):
@@ -359,17 +480,32 @@ def wait_for_decision(cfg: dict, wh: Webhooker | None, room_id: str | None,
                     ts = m.get("ts") or 0
                     if ts < since_ts_ms - 3000:
                         continue
-                    decision, password = parse_reply(m.get("body", ""))
+                    decision, had_extra = parse_reply(m.get("body", ""))
                     if decision is None:
                         continue  # not a decision; keep waiting
+                    if decision == "approve" and (require_password or had_extra):
+                        if had_extra:
+                            wh.send_notice(
+                                "⚠️ Passwords via Matrix are disabled — reply "
+                                "'yes', then enter the password in the desktop "
+                                "dialog or via the CLI (getpass).")
+                        continue  # no usable password from Matrix; keep waiting
                     return {
                         "decision": decision,
-                        "password": password,
+                        "password": None,
                         "source": "matrix",
                         "actor": m.get("sender"),
                     }
             except Exception:
                 pass  # webhooker hiccup; retry on the next tick
+        if (remind_at_monotonic is not None and not reminded
+                and time.monotonic() >= remind_at_monotonic):
+            reminded = True
+            if remind_cb is not None:
+                try:
+                    remind_cb()
+                except Exception:
+                    pass
         if time.monotonic() >= deadline_monotonic:
             return None
         time.sleep(interval)
@@ -418,15 +554,16 @@ def build_messages(rec: dict, request_id: str) -> tuple[str, str]:
         f"command: {cmd}\n"
         f"reason: {reason}\n"
         "Reply: yes (approve) · no (deny)\n"
-        "If it needs a password: yes <password>\n"
-        f"Terminal: {PROJECT_DIR / 'mcp_server.py'} approve {request_id} [password]"
+        "Passwords are entered locally (desktop dialog or CLI), never in Matrix.\n"
+        f"Terminal: {PROJECT_DIR / 'mcp_server.py'} approve {request_id}"
     )
     body = (
         f"🔐 <b>sudo request</b> <code>{esc(request_id)}</code><br>"
         f"command: <code>{esc(cmd)}</code><br>"
         f"<i>reason: {esc(reason)}</i><br>"
         "Reply <b>yes</b> to approve, <b>no</b> to deny.<br>"
-        "Needs a password? Reply <b>yes &lt;password&gt;</b>"
+        "If a password is needed you will be asked <b>locally</b> "
+        "(desktop dialog or CLI), never here."
     )
     return plain, body
 
@@ -502,10 +639,41 @@ def tool_sudo_run(command, reason: str = "", timeout_s=None) -> dict:
 
     # --- approval round --------------------------------------------------
     deadline = time.monotonic() + float(cfg["wait_timeout_s"])
+    gui_prompt(cfg, request_id, cmd_display, rec.get("reason", ""),
+               "approve", deadline)
+
+    remind_after = float(cfg.get("remind_after_s") or 0)
+    remind_at = time.monotonic() + remind_after if remind_after > 0 else None
+
+    def remind() -> None:
+        esc = html.escape
+        left = max(0, int(float(cfg["wait_timeout_s"]) - remind_after))
+        if wh and matrix_ok:
+            mxid = (cfg.get("remind_mxid") or "").strip()
+            mention = f"{mxid} " if mxid else ""
+            html_mention = (f'<a href="https://matrix.to/#/{esc(mxid)}">{esc(mxid)}</a> '
+                            if mxid else "")
+            wh.send(
+                f"🚨 {mention}sudo request {request_id} is still waiting "
+                f"({int(remind_after)}s): {cmd_display}\n"
+                f"Reply yes/no — it expires in {left}s.",
+                html_body=(
+                    f"🚨 {html_mention}<b>sudo {esc(request_id)}</b> still "
+                    f"waiting: <code>{esc(cmd_display)}</code><br>"
+                    f"Reply <b>yes</b>/<b>no</b> — expires in {left}s."
+                ),
+            )
+        desktop_notify(True, "InteractiveSudo — still waiting",
+                       f"{request_id}: {cmd_display}")
+
     d = wait_for_decision(cfg, wh if matrix_ok else None,
                           room_id if matrix_ok else None,
-                          since_ts_ms, deadline, request_id)
+                          since_ts_ms, deadline, request_id,
+                          remind_at_monotonic=remind_at, remind_cb=remind)
+    kill_dialogs(request_id)
     if d is None:
+        _, req_root = state_paths(cfg)
+        (req_root / request_id / "decision.json").unlink(missing_ok=True)
         update_request(cfg, request_id, status="expired",
                        detail="no decision before timeout")
         append_history(cfg, {"ts": utc_stamp(), "id": request_id,
@@ -551,22 +719,32 @@ def tool_sudo_run(command, reason: str = "", timeout_s=None) -> dict:
         if proc.returncode == 0:
             pass
         else:
-            # needs a password — second round
+            # needs a password — second round (local entry only)
             proc = None
             detail = None
+            deadline = time.monotonic() + float(cfg["password_ask_timeout_s"])
+            dialog_open = gui_prompt(cfg, request_id, cmd_display,
+                                     rec.get("reason", ""), "password", deadline)
             if wh and matrix_ok:
+                local_how = ("Enter it in the desktop dialog that just opened, or run"
+                             if dialog_open else
+                             "No desktop dialog available — run this in a terminal:")
                 wh.send(
                     f"🔐 sudo {request_id} was approved but needs a password.\n"
                     f"command: {cmd_display}\n"
-                    "Send the password now (or 'no' to abort)."
+                    f"{local_how}\n"
+                    f"  {PROJECT_DIR / 'mcp_server.py'} approve {request_id}\n"
+                    "Reply 'no' here to abort. (Passwords are never sent "
+                    "over Matrix.)"
                 )
             desktop_notify(cfg.get("desktop_notify", True),
                            "InteractiveSudo — password needed",
                            f"{request_id}: {cmd_display}")
-            deadline = time.monotonic() + float(cfg["password_ask_timeout_s"])
             d2 = wait_for_decision(cfg, wh if matrix_ok else None,
                                    room_id if matrix_ok else None,
-                                   int(time.time() * 1000), deadline, request_id)
+                                   int(time.time() * 1000), deadline, request_id,
+                                   require_password=True)
+            kill_dialogs(request_id)
             if d2 is None or d2["decision"] != "approve" or not d2.get("password"):
                 update_request(cfg, request_id, status="denied",
                                detail="no password provided")
@@ -655,9 +833,11 @@ def serve() -> None:
         "interactive-sudo",
         instructions=(
             "Human-in-the-loop sudo. Use sudo_run for ANY command that needs root. "
-            "The user is asked in Matrix and must reply 'yes' (and a password if "
-            "needed) before anything runs. Put a short human-readable reason in "
-            "every call. Never put secrets or passwords in 'reason'."
+            "The user is asked in Matrix (and via a desktop dialog) and must reply "
+            "'yes' before anything runs. Passwords are entered locally by the user "
+            "(desktop dialog or CLI) — never via Matrix, and never by you. Put a "
+            "short human-readable reason in every call. Never put secrets or "
+            "passwords in 'reason'."
         ),
     )
 
@@ -666,9 +846,10 @@ def serve() -> None:
                  timeout_s: int | None = None) -> dict:
         """Run a command via sudo after interactive human approval.
 
-        The request is announced in the user's Matrix room; the user must reply
-        'yes' to approve ('no' denies). If sudo needs a password, the user can
-        include it: 'yes <password>'. Returns ok, exit_code, stdout, stderr.
+        The request is announced in the user's Matrix room and as a desktop
+        dialog; the user must reply 'yes' (or click Approve) to approve, 'no'
+        (or click Deny) to deny. If sudo needs a password the user enters it
+        locally — never through chat. Returns ok, exit_code, stdout, stderr.
 
         Args:
             command: argv list (preferred) or shell string.
@@ -698,13 +879,12 @@ def cmd_serve(_args) -> int:
 def cmd_approve(args) -> int:
     cfg = load_config()
     rid = resolve_request_id(cfg, args.id)
-    password = args.password
-    if not password:
-        try:
-            import getpass
-            password = getpass.getpass(f"password for {rid} (blank = none): ") or None
-        except (EOFError, KeyboardInterrupt):
-            password = None
+    password = None
+    try:
+        import getpass
+        password = getpass.getpass(f"password for {rid} (blank = none): ") or None
+    except (EOFError, KeyboardInterrupt):
+        password = None
     set_decision(cfg, rid, "approve", password, os.environ.get("USER", "cli"))
     print(f"approved {rid}" + ("" if password else " (no password)"))
     return 0
@@ -759,9 +939,9 @@ def main() -> int:
     )
     sub = parser.add_subparsers(dest="cmd")
     sub.add_parser("serve", help="run the MCP stdio server (default)")
-    p_app = sub.add_parser("approve", help="approve a pending request")
+    p_app = sub.add_parser("approve", help="approve a pending request "
+                                           "(password via getpass only)")
     p_app.add_argument("id", nargs="?", default="last")
-    p_app.add_argument("password", nargs="?")
     p_den = sub.add_parser("deny", help="deny a pending request")
     p_den.add_argument("id", nargs="?", default="last")
     sub.add_parser("status", help="show pending requests + health")
