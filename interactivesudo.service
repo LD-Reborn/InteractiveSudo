@@ -1,0 +1,17 @@
+[Unit]
+Description=InteractiveSudo — human-in-the-loop root daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/lib/interactivesudo/mcp_server.py daemon
+Restart=always
+RestartSec=2
+RuntimeDirectory=interactivesudo
+StateDirectory=interactivesudo
+# The daemon is already root; forbid setuid/sudo escalation from within it.
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

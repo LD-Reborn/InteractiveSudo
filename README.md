@@ -1,124 +1,140 @@
 # InteractiveSudoMCP
 
-Human-in-the-loop `sudo` for coding agents (e.g. OpenCode). The agent can never
-run a privileged command unattended: every `sudo_run` call announces the exact
-command to you in Matrix **and** pops a local desktop dialog (zenity/kdialog),
-and only runs after you reply **yes** / click **Approve** — or after you
-approve/deny from any terminal via the CLI. Passwords are entered **locally
-only** and never travel over Matrix.
+Human-in-the-loop **root** for coding agents (e.g. OpenCode). The agent can
+never run a privileged command unattended: every `sudo_run` call is announced
+to you in Matrix, and only a **👍 from you** makes a root daemon execute it.
+No passwords anywhere, and no local approval channel — not even the agent
+itself can approve.
 
-Built for, and tested against, the local **MatrixWebhooker** on
-`http://localhost:8080` and bot `mybot`.
+## Architecture
+
+One file (`mcp_server.py`), two roles:
+
+| Role | Runs as | What it does |
+|---|---|---|
+| **Root daemon** (`daemon` subcommand, systemd) | `root` | Denylist check → Matrix announcement → waits for your 👍/👎 → executes as root → history. Stdlib-only. |
+| **MCP server** (`serve` subcommand, started by the agent) | you | Thin forwarder: sends requests to the daemon over a Unix socket, fires desktop notifications. No secrets, no privileges. |
+
+```
+agent ── sudo_run(cmd, reason) ──▶ MCP server (you) ── Unix socket ──▶ root daemon
+                                                                        │ 1. denylist (instant refusal)
+                                                                        │ 2. POST /webhook ──▶ your Matrix room
+                                                                        │    (client fires notify-send)
+                                                                        │ 3. wait for 👍/👎 — Matrix ONLY
+                                                                        │    └ remind_after_s: 🚨 mention ping
+                                                                        │ 4. client disconnected? → cancelled
+                                                                        ▼
+                                                                  approved?
+                                                                  ├─ no/expired → {ok:false, status:...}
+                                                                  └─ 👍 yes → run as root (argv, cwd=/, min env)
+                                                                            → {ok, exit_code, stdout, stderr}
+```
+
+## Why a root daemon instead of sudo + password?
+
+Passwords in chat are the problem this replaced: a `yes <password>` reply
+lands in the Matrix homeserver's history, on every synced device, and can
+leak into the agent's context. The daemon removes passwords entirely — and
+because the agent (running as you) has a shell, **local approval channels
+would be forgeable by a compromised account**. So approval comes only from
+Matrix, out-of-band from this machine.
+
+Verified properties (live-tested):
+- 👍/`yes` from your account approves; 👎/`no` denies; anything else is ignored.
+- The **bot's own 👍 is ignored** — a local process cannot self-approve.
+- Closing the connection (agent gave up) **cancels** the request.
+- `cancel last` from a terminal cancels a pending request.
 
 ## Tools (MCP, stdio)
 
 | Tool | What it does |
 |---|---|
-| `sudo_run(command, reason, timeout_s?)` | Announces the request in Matrix, waits for your decision, runs `sudo` on approval, returns `ok`, `exit_code`, `stdout`, `stderr`. |
-| `sudo_status()` | Webhooker health, bot/room, pending requests, cached-password state, recent history. |
+| `sudo_run(command, reason, timeout_s?)` | Announces in Matrix, waits for 👍/👎, runs as root on approval, returns `ok`, `exit_code`, `stdout`, `stderr`. |
+| `sudo_status()` | Daemon health, bot/room, pending requests, recent history. |
 
 `command` is preferably an argv list (`["apt", "install", "foo"]`); a shell
 string is also accepted (runs through `sh -c` — you approve exactly that string).
 
-## Approval channels
+## Approving
 
-1. **Desktop dialog** (zenity or kdialog, auto-detected): shows the command +
-   reason with **Approve** / **Deny** buttons. If sudo needs a password, a
-   second local dialog asks for it — the password never leaves the machine.
-2. **Matrix** — reply in the bot's room:
-   - `yes` → approve
-   - `no` → deny
-   (English and German keywords understood: `ja`, `nein`, `ok`, `abort`, …)
-   Passwords are **not** accepted via Matrix: they would land in the
-   homeserver's message history and could leak into the agent's context.
-   If you type `yes <password>` anyway, the server warns you and ignores it.
-3. **Terminal CLI** (works even if Matrix or the GUI are down):
-   ```sh
-   python3 mcp_server.py status                 # pending requests + health
-   python3 mcp_server.py approve last           # password via getpass prompt
-   python3 mcp_server.py deny last
-   python3 mcp_server.py history -n 10
-   ```
+Reply in the bot's Matrix room: **👍** or `yes`/`ja`/`ok` … to approve,
+**👎** or `no`/`nein`/`abort` … to deny. Nothing else counts. If nobody
+decides within `wait_timeout_s` (default 600s) the request expires; at
+`remind_after_s` (default 300s) the bot sends a **mention** (pushes your
+phone) and the desktop notification re-fires.
 
-If no decision arrives within `remind_after_s` (default 300s), the bot sends a
-**mention** of you in Matrix (forces a push notification) and re-fires the
-critical desktop notification before the request expires at `wait_timeout_s`.
+CLI (user side, no approval possible by design):
 
-## Flow
-
-```
-agent ── sudo_run(cmd, reason) ──▶ server
-                                   │ 1. denylist check (instant refusal)
-                                   │ 2. POST /webhook  ──▶ your Matrix room
-                                   │ 3. Approve/Deny dialog + notify-send
-                                   │ 4. poll for decision (Matrix / dialog / CLI)
-                                   │    └ at remind_after_s: mention ping 🚨
-                                   ▼
-                           approved?
-                           ├─ no  → {ok:false, status:"denied"}
-                           └─ yes → sudo -n            (no password needed)
-                                    sudo -S <pw>       (pw from local dialog/CLI)
-                                    → {ok, exit_code, stdout, stderr}
+```sh
+python3 mcp_server.py status          # daemon health + pending + history
+python3 mcp_server.py history -n 10   # recent completed requests
+python3 mcp_server.py cancel last     # cancel a pending request
 ```
 
-If the command was approved but `sudo -n` says a password is required, a
-**local** password dialog opens and Matrix tells you to enter it locally
-(desktop dialog or `mcp_server.py approve`) — never in the chat.
+## Install (human sudo action — do not let the agent run this)
 
-## Security model
+```sh
+cd ~/.config/InteractiveSudo
+./install.sh
+```
 
-- **Every run requires an explicit human decision.** Nothing is auto-approved.
-- The CLI `approve` command only accepts passwords via `getpass` (no
-  positional arg), so they never land in shell history either.
-- **Denylist** (`denylist` in `config.json`): substring patterns that are
-  refused instantly without asking (defaults block `mkfs`, `dd if=`,
-  fork bombs, `rm -rf /`, raw disk writes, …).
-- **Passwords never travel over Matrix.** They are entered in the local
-  desktop dialog or via `getpass` in a terminal — so they never reach the
-  homeserver, your phone, or the agent's context. A `yes <password>` reply is
-  ignored with a warning. Passwords are never written to disk: the decision
-  file is deleted immediately after use; history only records a
-  `password_provided` boolean.
-- A password that actually worked may be held **in server memory** for
-  `password_ttl_s` seconds (default 300, set `0` to never cache).
-- State lives in `~/.local/state/interactivesudo/` (requests, `history.jsonl`,
-  all `0600`).
-- The bot API key lives in `secrets/api_key` (`0600`, git-ignored).
+`install.sh` deploys:
 
-## Setup (already done on this machine)
+- `/usr/local/lib/interactivesudo/mcp_server.py` — daemon code, **root-owned**
+  (a user-writable daemon would be an escalation path: edit code, wait for
+  restart → root runs your code). Edit in `~/.config/InteractiveSudo/` and
+  re-run `install.sh` to deploy.
+- `/etc/interactivesudo/config.json` (0640 root) and
+  `/etc/interactivesudo/api_key` (0600 root) — created once, then preserved.
+- `/etc/systemd/system/interactivesudo.service` — enabled, started.
 
-- `~/projects/InteractiveSudoMCP/` — this project
-  - `.venv` — Python venv with `mcp` (pinned `<2`, FastMCP) + `httpx`
-  - `mcp_server.py` — the whole server (MCP + CLI)
-  - `config.json` — runtime settings
-  - `secrets/api_key` — MatrixWebhooker api_key of bot `mybot`
-- Registered in `~/.config/opencode/opencode.json` under
-  `mcp.servers.sudo` (backup of the previous config: `opencode.json.bak-20261009`).
+Check: `systemctl status interactivesudo`, `journalctl -u interactivesudo -f`,
+then `python3 mcp_server.py status`.
 
-## Configuration (`config.json`)
+**Important:** the old `secrets/api_key` sat in a cloud-synced folder (pushed to
+the server and all devices). `install.sh` imports it to `/etc` and tells you
+to delete the project copy — and you should **rotate the key** in
+MatrixWebhooker afterwards.
+
+## Configuration
+
+Daemon (`/etc/interactivesudo/config.json`, see `daemon_config.example.json`):
 
 | Key | Default | Meaning |
 |---|---|---|
 | `webhooker_url` | `http://localhost:8080` | MatrixWebhooker base URL |
-| `bot_name` | `mybot` | which webhooker bot sends the requests |
-| `api_key_file` | `secrets/api_key` | file containing that bot's API key |
-| `state_dir` | `~/.local/state/interactivesudo` | requests + history |
-| `desktop_notify` | `true` | fire `notify-send` on requests |
-| `desktop_gui` | `true` | zenity/kdialog Approve/Deny + password dialogs |
-| `wait_timeout_s` | `600` | how long to wait for yes/no |
-| `remind_after_s` | `300` | Matrix mention ping after this long (`0` = off) |
-| `remind_mxid` | `""` | your MXID, mentioned so the ping pushes |
-| `password_ask_timeout_s` | `180` | how long to wait for a follow-up password |
-| `command_timeout_s` | `300` | max runtime of the sudo command |
-| `password_ttl_s` | `300` | in-memory password cache TTL (`0` = off) |
-| `max_output_chars` | `20000` | stdout/stderr capture cap |
+| `api_key_file` | `/etc/interactivesudo/api_key` | bot API key (root-only) |
+| `socket_path` | `/run/interactivesudo/agent.sock` | daemon socket (0660, group `socket_group`) |
+| `socket_group` | your username | group allowed to submit requests |
+| `state_dir` | `/var/lib/interactivesudo` | history (root-only) |
+| `wait_timeout_s` | `600` | how long to wait for 👍/👎 |
+| `remind_after_s` | `300` | mention ping after this long (`0` = off) |
+| `remind_mxid` | your MXID | mentioned so the ping pushes |
+| `command_timeout_s` | `300` | max runtime of the command |
+| `max_pending` | `5` | refuse new requests beyond this |
 | `denylist` | see file | substrings refused without asking |
+
+Client (`config.json` next to `mcp_server.py`): `socket_path`, `desktop_notify`.
+Env overrides: `SUDOMCP_CONFIG` (client), `SUDOMCP_DAEMON_CONFIG` (daemon).
+
+## Security model
+
+- **Approval only via Matrix** from your account; the bot's own messages are
+  ignored. No decision files, no CLI approve — a compromised user account
+  (or the agent) cannot self-approve.
+- **Root-owned daemon code + key**; deployment is a deliberate human sudo
+  (`install.sh`).
+- **Denylist** substrings are refused instantly without asking.
+- Commands run as root with a minimal environment, `cwd=/`, and a timeout.
+- Client disconnect ⇒ request cancelled before execution.
+- History (`/var/lib/interactivesudo/history.jsonl`, 0600) records command,
+  reason, approver, exit code.
+- Trust anchor: your Matrix account + homeserver. If the homeserver is
+  compromised, an attacker can send 👍 — keep E2EE/offline-key hygiene.
 
 ## Notes
 
-- Run the server as your normal user; it escalates **only** through `sudo`
-  and only after your approval — this replaces the `sudo opencode` pattern.
-- A command that reads from stdin gets EOF after the password (standard
-  `sudo -S` behavior).
-- `sudo -n` is tried first when no password is available, so NOPASSWD
-  sudoers rules keep working without prompting you.
+- The MCP server (user-side) needs the venv (`mcp` package); the daemon is
+  stdlib-only and runs on the system python.
+- A command that reads stdin gets EOF (captured output, no tty).
+- Registered in `~/.config/opencode/opencode.json` under `mcp.servers.sudo`.

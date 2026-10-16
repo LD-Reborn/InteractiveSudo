@@ -1,41 +1,52 @@
 #!/usr/bin/env python3
-"""InteractiveSudoMCP — human-in-the-loop `sudo` for coding agents.
+"""InteractiveSudoMCP — human-in-the-loop root for coding agents.
 
-MCP tools (stdio transport):
-  sudo_run(command, reason, timeout_s)  Ask the human to approve, then run via sudo.
-  sudo_status()                         Webhooker health, pending requests, recent history.
+Architecture (v2)
+-----------------
+One file, two roles:
 
-CLI (same file, no MCP required):
-  mcp_server.py serve                     Run the MCP server (default command).
-  mcp_server.py approve [id|last] [pw]    Approve a pending request from a terminal.
-  mcp_server.py deny    [id|last]         Deny a pending request.
-  mcp_server.py status                    Pending requests + webhooker health.
-  mcp_server.py history [-n N]            Show recent completed requests.
+* Root daemon (`mcp_server.py daemon`, systemd service, stdlib only):
+  owns the whole flow — denylist check, Matrix announcement, waiting for
+  your 👍/👎, execution as root, history. Approval comes ONLY from Matrix
+  (out-of-band from this machine): no local process — including the agent
+  itself — can approve a request.
+
+* MCP server (`mcp_server.py serve`, runs as you): thin forwarder. Sends
+  requests to the daemon over a Unix socket and fires desktop
+  notifications. Holds no secrets and no privileges.
+
+MCP tools (stdio):
+  sudo_run(command, reason, timeout_s)  Ask for approval, then run as root.
+  sudo_status()                         Daemon health, pending, history.
+
+CLI (user side):
+  mcp_server.py status            Daemon status + recent history.
+  mcp_server.py history [-n N]    Recent completed requests.
+  mcp_server.py cancel  [id|last] Cancel a pending request.
 
 How it works
 ------------
-1. The agent calls sudo_run with the command (argv list or shell string) and a reason.
-2. The server announces the request in the Matrix room (via MatrixWebhooker),
-   pops a local desktop dialog (zenity/kdialog) with Approve/Deny, and waits.
-3. The human replies "yes" / "no" in Matrix, clicks the desktop dialog, or
-   approves/denies from any terminal with the CLI.
-4. Passwords are entered LOCALLY only (desktop dialog or CLI getpass) — never
-   via Matrix, so they never reach the homeserver or the agent's context.
-5. Only on approval does the server run `sudo -n` (or `sudo -S` with the
-   locally-entered password) and return stdout/stderr/exit code to the agent.
-6. If no decision arrives within `remind_after_s` seconds, the server sends a
-   Matrix mention (push notification) and re-fires the desktop notification.
+1. The agent calls sudo_run; the MCP server forwards it to the daemon.
+2. The daemon checks the denylist, announces the request in Matrix, waits.
+   At remind_after_s it sends a mention ping (push notification) and asks
+   the client to re-fire the desktop notification.
+3. You reply 👍 / yes to approve, 👎 / no to deny. Nothing else approves.
+4. The daemon runs the command as root and returns exit code, stdout and
+   stderr to the agent. If the requesting client disconnected meanwhile,
+   the request is cancelled instead of executed.
 
 Security model
 --------------
-- Every run requires an explicit human decision; nothing is auto-approved.
-- A `denylist` of substrings is refused immediately without asking.
-- Passwords never travel over Matrix: they are entered in the local desktop
-  dialog or via getpass in a terminal. They are never written to disk
-  (the decision file is deleted after use and holds at most the
-  just-entered password). History logs only booleans like "password_provided".
-- A password that was actually used may be kept in server memory for
-  `password_ttl_s` seconds (0 = never cache).
+- Approval only ever arrives via Matrix from your account; the bot's own
+  messages are ignored. There are no local approval channels (no decision
+  files, no CLI approve) — a compromised user account cannot self-approve.
+- The deployed daemon code and its API key are root-owned. You edit the
+  project copy and re-deploy with install.sh — a deliberate human sudo.
+- Denylist substrings are refused without asking.
+- Commands run as root with a minimal environment and cwd=/.
+- If the requesting client disconnects before approval, the request is
+  cancelled; a command that already started runs to completion.
+- No passwords anywhere: the daemon is already root.
 """
 
 from __future__ import annotations
@@ -45,33 +56,39 @@ import html
 import json
 import os
 import shutil
+import socket
+import socketserver
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-import httpx
-
 PROJECT_DIR = Path(__file__).resolve().parent
-DEFAULT_CONFIG_PATH = PROJECT_DIR / "config.json"
 
-DEFAULTS: dict = {
-    "webhooker_url": "http://localhost:8083",
-    "bot_name": "mybot",
-    "api_key_file": "secrets/api_key",
-    "state_dir": "",  # default: ~/.local/state/interactivesudo
+USER_DEFAULTS: dict = {
+    "socket_path": "/run/interactivesudo/agent.sock",
     "desktop_notify": True,
-    "desktop_gui": True,           # zenity/kdialog approve + password prompts
+}
+
+DAEMON_DEFAULTS: dict = {
+    "webhooker_url": "http://localhost:8080",
+    "bot_name": "mybot",
+    "api_key_file": "/etc/interactivesudo/api_key",
+    "socket_path": "/run/interactivesudo/agent.sock",
+    "socket_group": "operator",     # group allowed to talk to the daemon
+    "state_dir": "/var/lib/interactivesudo",
     "poll_interval_s": 1.5,
-    "wait_timeout_s": 600,          # how long to wait for yes/no
-    "remind_after_s": 300,          # Matrix mention ping after this long (0 = off)
+    "wait_timeout_s": 600,          # how long to wait for 👍/👎
+    "remind_after_s": 300,          # Matrix mention ping after this (0 = off)
     "remind_mxid": "",              # your MXID, mentioned so the ping pushes
-    "password_ask_timeout_s": 180,  # how long to wait for a password
-    "command_timeout_s": 300,       # max runtime of the sudo command itself
-    "password_ttl_s": 300,          # in-memory cache of a working password
+    "command_timeout_s": 300,       # max runtime of the command itself
     "max_output_chars": 20000,      # stdout/stderr capture cap
+    "max_pending": 5,               # refuse new requests beyond this many
     "denylist": [
         "mkfs",
         "dd if=",
@@ -83,6 +100,13 @@ DEFAULTS: dict = {
     ],
 }
 
+RUN_ENV = {
+    "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "HOME": "/root",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+}
+
 APPROVE_WORDS = {
     "yes", "y", "yep", "yeah", "ok", "okay", "approve", "approved", "go", "sure",
     "ja", "bitte", "klar", "👍", "👍🏼", "👍🏽",
@@ -92,8 +116,9 @@ DENY_WORDS = {
     "nein", "abbrechen", "ablehnen", "ablehne", "👎", "👎🏼", "👎🏽",
 }
 
+
 # ---------------------------------------------------------------------------
-# config / state
+# config
 # ---------------------------------------------------------------------------
 
 
@@ -101,192 +126,32 @@ def utc_stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def load_config() -> dict:
-    cfg = dict(DEFAULTS)
-    cfg_path = Path(os.environ.get("SUDOMCP_CONFIG", "") or DEFAULT_CONFIG_PATH)
-    if cfg_path.exists():
+def _load_cfg(defaults: dict, env_var: str, default_path: str) -> dict:
+    cfg = dict(defaults)
+    path = Path(os.environ.get(env_var, "") or default_path)
+    if path.exists():
         try:
-            user_cfg = json.loads(cfg_path.read_text())
+            user_cfg = json.loads(path.read_text())
         except Exception as exc:
-            raise SystemExit(f"config error in {cfg_path}: {exc}") from exc
+            raise SystemExit(f"config error in {path}: {exc}") from exc
         if not isinstance(user_cfg, dict):
-            raise SystemExit(f"config error in {cfg_path}: top level must be an object")
+            raise SystemExit(f"config error in {path}: top level must be an object")
         cfg.update(user_cfg)
-    for key in ("api_key_file", "state_dir"):
-        if cfg.get(key) and not Path(str(cfg[key])).is_absolute():
-            cfg[key] = str((PROJECT_DIR / str(cfg[key])).resolve())
-    if not cfg.get("state_dir"):
-        cfg["state_dir"] = str(Path.home() / ".local" / "state" / "interactivesudo")
-    Path(cfg["state_dir"]).mkdir(parents=True, exist_ok=True)
     return cfg
 
 
-def read_api_key(cfg: dict) -> str:
-    key_path = Path(cfg["api_key_file"])
-    if not key_path.exists():
-        raise RuntimeError(
-            f"api key file not found: {key_path} — copy your MatrixWebhooker "
-            f"bot api_key there (chmod 600)"
-        )
-    key = key_path.read_text().strip()
-    if not key:
-        raise RuntimeError(f"api key file is empty: {key_path}")
-    return key
+def load_user_config() -> dict:
+    return _load_cfg(USER_DEFAULTS, "SUDOMCP_CONFIG", str(PROJECT_DIR / "config.json"))
 
 
-def state_paths(cfg: dict) -> tuple[Path, Path]:
-    root = Path(cfg["state_dir"])
-    return root, root / "requests"
-
-
-def write_json(path: Path, obj, mode: int = 0o600) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(obj, indent=2, ensure_ascii=False) + "\n")
-    os.chmod(path, mode)
-
-
-def read_json(path: Path):
-    try:
-        return json.loads(path.read_text())
-    except Exception:
-        return None
-
-
-def append_history(cfg: dict, entry: dict) -> None:
-    root, _ = state_paths(cfg)
-    with open(root / "history.jsonl", "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    os.chmod(root / "history.jsonl", 0o600)
-
-
-def tail_history(cfg: dict, n: int = 5):
-    root, _ = state_paths(cfg)
-    p = root / "history.jsonl"
-    if not p.exists():
-        return []
-    lines = p.read_text().splitlines()[-n:]
-    out = []
-    for line in lines:
-        try:
-            out.append(json.loads(line))
-        except Exception:
-            pass
-    return list(reversed(out))
-
-
-def pending_requests(cfg: dict) -> list[dict]:
-    _, req_root = state_paths(cfg)
-    if not req_root.exists():
-        return []
-    out = []
-    for p in sorted(req_root.glob("*.json")):
-        rec = read_json(p)
-        if rec and rec.get("status") == "waiting":
-            out.append(rec)
-    return list(reversed(out))
-
-
-def resolve_request_id(cfg: dict, arg: str) -> str:
-    if arg and arg != "last":
-        return arg
-    root, _ = state_paths(cfg)
-    last = root / "last_request"
-    if last.exists():
-        return last.read_text().strip()
-    pend = pending_requests(cfg)
-    if pend:
-        return pend[0]["id"]
-    raise SystemExit("no pending request found (nothing to approve/deny)")
-
-
-def set_decision(cfg: dict, request_id: str, decision: str, password: str | None,
-                 actor: str, source: str = "cli") -> None:
-    _, req_root = state_paths(cfg)
-    write_json(
-        req_root / f"{request_id}" / "decision.json",
-        {
-            "decision": decision,
-            "password": password,
-            "source": source,
-            "actor": actor,
-            "ts": utc_stamp(),
-        },
-    )
+def load_daemon_config() -> dict:
+    return _load_cfg(DAEMON_DEFAULTS, "SUDOMCP_DAEMON_CONFIG",
+                     "/etc/interactivesudo/config.json")
 
 
 # ---------------------------------------------------------------------------
-# webhooker (Matrix) client
+# shared helpers
 # ---------------------------------------------------------------------------
-
-
-class Webhooker:
-    """Tiny client for MatrixWebhooker (localhost:8083)."""
-
-    def __init__(self, cfg: dict):
-        self.base = cfg["webhooker_url"].rstrip("/")
-        self.key = read_api_key(cfg)
-        self.bot_name = cfg["bot_name"]
-        self.bot_user: str | None = None
-        self.client = httpx.Client(timeout=10.0)
-        self._headers = {"X-API-Key": self.key}
-
-    def health(self) -> dict:
-        r = self.client.get(self.base + "/health")
-        r.raise_for_status()
-        return r.json()
-
-    def me(self) -> dict:
-        r = self.client.get(self.base + "/me", headers=self._headers)
-        r.raise_for_status()
-        d = r.json()
-        self.bot_user = d.get("user")
-        return d
-
-    def send(self, text: str, html_body: str | None = None,
-             msgtype: str = "m.text") -> dict:
-        body: dict = {"text": text, "msgtype": msgtype}
-        if html_body:
-            body["html"] = html_body
-        r = self.client.post(self.base + "/webhook", headers=self._headers, json=body)
-        r.raise_for_status()
-        return r.json()
-
-    def send_notice(self, text: str) -> None:
-        try:
-            self.send(text, msgtype="m.notice")
-        except Exception:
-            pass
-
-    def messages(self, room_id: str, limit: int = 25) -> list[dict]:
-        r = self.client.get(
-            f"{self.base}/rooms/{room_id}/messages",
-            headers=self._headers,
-            params={"limit": limit},
-        )
-        r.raise_for_status()
-        return r.json().get("messages", [])
-
-
-# ---------------------------------------------------------------------------
-# core flow
-# ---------------------------------------------------------------------------
-
-_PW_CACHE: dict = {"pw": None, "expires": 0.0}
-
-
-def cached_password(cfg: dict) -> str | None:
-    if _PW_CACHE["pw"] is None:
-        return None
-    if time.monotonic() > _PW_CACHE["expires"]:
-        _PW_CACHE.update(pw=None, expires=0.0)
-        return None
-    return _PW_CACHE["pw"]
-
-
-def remember_password(cfg: dict, pw: str) -> None:
-    ttl = int(cfg.get("password_ttl_s") or 0)
-    if ttl > 0:
-        _PW_CACHE.update(pw=pw, expires=time.monotonic() + ttl)
 
 
 def normalize_command(command) -> list[str]:
@@ -312,8 +177,6 @@ def parse_reply(raw: str) -> tuple[str | None, bool]:
     """Parse a human reply into (decision, had_extra_words).
 
     decision is "approve" | "deny" | None (not a decision).
-    Passwords are never accepted via Matrix; extra words after an approve
-    word are flagged so the caller can warn the user.
     """
     text = (raw or "").strip().strip("`").strip()
     if not text:
@@ -332,6 +195,13 @@ def parse_reply(raw: str) -> tuple[str | None, bool]:
     return None, False
 
 
+def cap(text: str | None, limit: int) -> str:
+    text = text or ""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n… [truncated {len(text) - limit} more chars]"
+
+
 def desktop_notify(enabled: bool, title: str, body: str) -> None:
     if not enabled or not shutil.which("notify-send"):
         return
@@ -345,511 +215,534 @@ def desktop_notify(enabled: bool, title: str, body: str) -> None:
         pass
 
 
+def log(msg: str) -> None:
+    print(f"[{utc_stamp()}] {msg}", file=sys.stderr, flush=True)
+
+
 # ---------------------------------------------------------------------------
-# desktop GUI (local-only approvals and passwords)
+# webhooker (Matrix) client — stdlib only, used by the daemon
 # ---------------------------------------------------------------------------
 
-_ACTIVE_DIALOGS: dict[str, subprocess.Popen] = {}
 
+class Webhooker:
+    """Tiny stdlib client for MatrixWebhooker."""
 
-def detect_gui_tool(cfg: dict) -> str | None:
-    """Pick zenity or kdialog when a desktop session is reachable."""
-    if not cfg.get("desktop_gui", True):
-        return None
-    if not (os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY")):
-        return None
-    desktop = os.environ.get("XDG_CURRENT_DESKTOP", "").upper()
-    candidates = ["kdialog", "zenity"] if "KDE" in desktop else ["zenity", "kdialog"]
-    for tool in candidates:
-        if shutil.which(tool):
-            return tool
-    return None
+    def __init__(self, cfg: dict):
+        self.base = cfg["webhooker_url"].rstrip("/")
+        key_path = Path(cfg["api_key_file"])
+        if not key_path.exists():
+            raise RuntimeError(f"api key file not found: {key_path}")
+        self.key = key_path.read_text().strip()
+        if not self.key:
+            raise RuntimeError(f"api key file is empty: {key_path}")
+        self.bot_user: str | None = None
 
+    def _req(self, method: str, path: str, body: dict | None = None) -> dict:
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(
+            self.base + path, data=data, method=method,
+            headers={"X-API-Key": self.key,
+                     "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read().decode())
 
-def gui_prompt(cfg: dict, request_id: str, cmd_display: str, reason: str,
-               mode: str, deadline_monotonic: float) -> bool:
-    """Pop a local dialog in a background thread (mode: 'approve'|'password').
+    def health(self) -> dict:
+        return self._req("GET", "/health")
 
-    'approve': Approve/Deny question dialog; closing the window denies.
-    'password': password entry; Cancel/close does nothing (other channels
-    still work, and the request eventually expires).
-    Decisions go into the local decision file — never into Matrix.
-    Returns True if a dialog was actually launched.
-    """
-    tool = detect_gui_tool(cfg)
-    if not tool:
-        return False
-    actor = os.environ.get("USER", "desktop")
-    if mode == "approve":
-        text = (f"sudo request {request_id}\n\n"
-                f"Command:\n{cmd_display}\n\n"
-                f"Reason: {reason or '-'}\n\nApprove?")
-        if tool == "kdialog":
-            cmd = ["kdialog", "--title", "InteractiveSudo — approval needed",
-                   "--question", text]
-        else:
-            cmd = ["zenity", "--question",
-                   "--title", "InteractiveSudo — approval needed",
-                   "--width", "560", "--ok-label", "Approve",
-                   "--cancel-label", "Deny", "--text", text]
-    else:
-        prompt = (f"sudo {request_id} needs your password (entered locally, "
-                  f"never sent over Matrix):\n\n{cmd_display}")
-        if tool == "kdialog":
-            cmd = ["kdialog", "--title", "InteractiveSudo — password",
-                   "--password", prompt]
-        else:
-            cmd = ["zenity", "--password", "--title", "InteractiveSudo — password",
-                   "--text", prompt]
+    def me(self) -> dict:
+        d = self._req("GET", "/me")
+        self.bot_user = d.get("user")
+        return d
 
-    def run() -> None:
+    def send(self, text: str, html_body: str | None = None,
+             msgtype: str = "m.text") -> dict:
+        body: dict = {"text": text, "msgtype": msgtype}
+        if html_body:
+            body["html"] = html_body
+        return self._req("POST", "/webhook", body)
+
+    def send_notice(self, text: str) -> None:
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                    stderr=subprocess.DEVNULL, text=True)
+            self.send(text, msgtype="m.notice")
         except Exception:
-            return
-        _ACTIVE_DIALOGS[request_id] = proc
-        remaining = max(1.0, deadline_monotonic - time.monotonic())
-        try:
-            out, _ = proc.communicate(timeout=remaining)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            out = None
-        _ACTIVE_DIALOGS.pop(request_id, None)
-        if out is None:
-            return
-        rc = proc.returncode
-        if mode == "approve":
-            if rc == 0:
-                set_decision(cfg, request_id, "approve", None, actor, source="gui")
-            elif rc == 1:  # Deny clicked or window closed: fail closed
-                set_decision(cfg, request_id, "deny", None, actor, source="gui")
-            # other rc: the dialog tool itself failed; keep waiting
-        else:
-            pw = out.strip("\n")
-            if rc == 0 and pw:
-                set_decision(cfg, request_id, "approve", pw, actor, source="gui")
-            # Cancel/close: no decision, other channels still work
+            pass
 
-    threading.Thread(target=run, daemon=True).start()
-    return True
+    def messages(self, room_id: str, limit: int = 25) -> list[dict]:
+        q = urllib.parse.quote(room_id, safe="")
+        return self._req("GET", f"/rooms/{q}/messages?limit={limit}").get("messages", [])
 
 
-def kill_dialogs(*request_ids: str) -> None:
-    for rid in request_ids:
-        proc = _ACTIVE_DIALOGS.pop(rid, None)
-        if proc is not None and proc.poll() is None:
+# ---------------------------------------------------------------------------
+# root daemon
+# ---------------------------------------------------------------------------
+
+
+class ClientGone(Exception):
+    """The requesting MCP client disconnected."""
+
+
+class PendingRequest:
+    def __init__(self, request_id: str, argv: list[str], reason: str,
+                 timeout_s):
+        self.id = request_id
+        self.argv = argv
+        self.reason = reason
+        self.timeout_s = timeout_s
+        self.ts = utc_stamp()
+        self.cancel = threading.Event()
+
+
+class Daemon:
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self.wh = Webhooker(cfg)
+        self.state = Path(cfg["state_dir"])
+        self.state.mkdir(parents=True, exist_ok=True)
+        self.lock = threading.Lock()
+        self.pending: dict[str, PendingRequest] = {}
+        self.claimed: set[str] = set()   # Matrix event ids already acted on
+        self.last_id: str | None = None
+
+    # -- history ----------------------------------------------------------
+
+    def append_history(self, entry: dict) -> None:
+        p = self.state / "history.jsonl"
+        with open(p, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        os.chmod(p, 0o600)
+
+    def tail_history(self, n: int = 10) -> list[dict]:
+        p = self.state / "history.jsonl"
+        if not p.exists():
+            return []
+        out = []
+        for line in p.read_text().splitlines()[-n:]:
             try:
-                proc.kill()
+                out.append(json.loads(line))
             except Exception:
                 pass
+        return list(reversed(out))
 
+    # -- Matrix -----------------------------------------------------------
 
-def wait_for_decision(cfg: dict, wh: Webhooker | None, room_id: str | None,
-                      since_ts_ms: int, deadline_monotonic: float,
-                      request_id: str, require_password: bool = False,
-                      remind_at_monotonic: float | None = None,
-                      remind_cb=None) -> dict | None:
-    """Poll for a decision: local decision file (GUI/CLI) or Matrix reply.
+    def announce_text(self, request_id: str, cmd: str,
+                      reason: str) -> tuple[str, str]:
+        esc = html.escape
+        plain = (
+            f"🔐 sudo request {request_id}\n"
+            f"command: {cmd}\n"
+            f"reason: {reason or '-'}\n"
+            "Reply 👍 (or yes) to approve · 👎 (or no) to deny"
+        )
+        body = (
+            f"🔐 <b>sudo request</b> <code>{esc(request_id)}</code><br>"
+            f"command: <code>{esc(cmd)}</code><br>"
+            f"<i>reason: {esc(reason or '-')}</i><br>"
+            "Reply <b>👍</b>/<b>yes</b> to approve, <b>👎</b>/<b>no</b> to deny."
+        )
+        return plain, body
 
-    Matrix is decision-only: passwords are never accepted from Matrix.
-    With require_password, approvals without a password (Matrix or GUI) are
-    ignored until a password arrives locally or the round times out.
-    remind_cb fires once when remind_at_monotonic is reached.
-    Returns {"decision","password","source","actor"} or None on timeout.
-    """
-    _, req_root = state_paths(cfg)
-    decision_file = req_root / request_id / "decision.json"
-    interval = float(cfg["poll_interval_s"])
-    reminded = False
-    while True:
-        if decision_file.exists():
-            d = read_json(decision_file)
-            decision_file.unlink(missing_ok=True)
-            if d:
-                if (require_password and d.get("decision") == "approve"
-                        and not d.get("password")):
-                    pass  # approval without password: keep waiting for one
-                else:
-                    return d
-        if wh is not None and room_id:
+    def send_reminder(self, p: PendingRequest) -> None:
+        cfg = self.cfg
+        esc = html.escape
+        cmd = cmdline_of(p.argv)
+        mxid = (cfg.get("remind_mxid") or "").strip()
+        left = max(0, int(float(cfg["wait_timeout_s"])
+                          - float(cfg.get("remind_after_s") or 0)))
+        mention = f"{mxid} " if mxid else ""
+        html_mention = (f'<a href="https://matrix.to/#/{esc(mxid)}">{esc(mxid)}</a> '
+                        if mxid else "")
+        try:
+            self.wh.send(
+                f"🚨 {mention}sudo request {p.id} is still waiting: {cmd}\n"
+                f"Reply 👍/yes or 👎/no — it expires in {left}s.",
+                html_body=(
+                    f"🚨 {html_mention}<b>sudo {esc(p.id)}</b> still waiting: "
+                    f"<code>{esc(cmd)}</code><br>"
+                    f"Reply 👍/👎 — expires in {left}s."
+                ),
+            )
+            log(f"{p.id}: reminder ping sent")
+        except Exception as exc:
+            log(f"{p.id}: reminder ping failed: {exc}")
+
+    def wait_matrix(self, p: PendingRequest, room_id: str, since_ts_ms: int,
+                    deadline: float, remind_at: float | None,
+                    emit) -> tuple[str | None, str | None]:
+        """Poll the room for 👍/👎. Returns (decision, actor) or (None, None).
+
+        Raises ClientGone if the requesting client disconnects (emit fails).
+        """
+        interval = float(self.cfg["poll_interval_s"])
+        reminded = False
+        while not p.cancel.is_set():
             try:
-                for m in wh.messages(room_id, limit=25):
-                    if m.get("sender") == wh.bot_user:
+                for m in self.wh.messages(room_id, limit=25):
+                    if m.get("sender") == self.wh.bot_user:
                         continue
                     ts = m.get("ts") or 0
                     if ts < since_ts_ms - 3000:
                         continue
-                    decision, had_extra = parse_reply(m.get("body", ""))
+                    decision, _ = parse_reply(m.get("body", ""))
                     if decision is None:
-                        continue  # not a decision; keep waiting
-                    if decision == "approve" and (require_password or had_extra):
-                        if had_extra:
-                            wh.send_notice(
-                                "⚠️ Passwords via Matrix are disabled — reply "
-                                "'yes', then enter the password in the desktop "
-                                "dialog or via the CLI (getpass).")
-                        continue  # no usable password from Matrix; keep waiting
-                    return {
-                        "decision": decision,
-                        "password": None,
-                        "source": "matrix",
-                        "actor": m.get("sender"),
-                    }
+                        continue
+                    # One decision message approves/denies exactly one request.
+                    key = m.get("id") or f"{ts}:{m.get('sender')}:{m.get('body')}"
+                    with self.lock:
+                        if key in self.claimed:
+                            continue
+                        self.claimed.add(key)
+                        if len(self.claimed) > 500:
+                            self.claimed.clear()
+                    return decision, m.get("sender")
             except Exception:
                 pass  # webhooker hiccup; retry on the next tick
-        if (remind_at_monotonic is not None and not reminded
-                and time.monotonic() >= remind_at_monotonic):
-            reminded = True
-            if remind_cb is not None:
-                try:
-                    remind_cb()
-                except Exception:
-                    pass
-        if time.monotonic() >= deadline_monotonic:
-            return None
-        time.sleep(interval)
+            now = time.monotonic()
+            if remind_at is not None and not reminded and now >= remind_at:
+                reminded = True
+                self.send_reminder(p)
+                emit({"event": "reminding", "request_id": p.id})
+            if now >= deadline:
+                return None, None
+            time.sleep(interval)
+        return "cancelled", None
+
+    # -- main flow ----------------------------------------------------------
+
+    def run_flow(self, p: PendingRequest, emit) -> dict:
+        cfg = self.cfg
+        t0 = time.monotonic()
+        cmd = cmdline_of(p.argv)
+
+        def result(extra: dict) -> dict:
+            out = {"request_id": p.id, "command": cmd,
+                   "duration_s": round(time.monotonic() - t0, 2)}
+            out.update(extra)
+            return out
+
+        joined = " ".join(p.argv)
+        for pattern in cfg.get("denylist") or []:
+            if pattern and pattern in joined:
+                log(f"{p.id}: refused by denylist pattern {pattern!r}")
+                return result({
+                    "ok": False, "status": "refused_by_policy",
+                    "detail": f"command matches denylist pattern {pattern!r} — "
+                              "denied without asking. Fix the command or adjust "
+                              "the denylist in /etc/interactivesudo/config.json.",
+                })
+
+        try:
+            me = self.wh.me()
+            plain, body_html = self.announce_text(p.id, cmd, p.reason)
+            sent = self.wh.send(plain, body_html)
+            room_id = sent.get("room") or me.get("room")
+            since_ts_ms = int(time.time() * 1000)
+        except Exception as exc:
+            return result({"ok": False, "status": "error",
+                           "detail": f"cannot reach Matrix webhooker at "
+                                     f"{cfg['webhooker_url']}: {exc}"})
+        log(f"{p.id}: announced in {room_id}: {cmd}")
+        emit({"event": "pending", "request_id": p.id, "command": cmd})
+
+        deadline = time.monotonic() + float(cfg["wait_timeout_s"])
+        remind_after = float(cfg.get("remind_after_s") or 0)
+        remind_at = time.monotonic() + remind_after if remind_after > 0 else None
+        try:
+            decision, actor = self.wait_matrix(p, room_id, since_ts_ms,
+                                               deadline, remind_at, emit)
+        except ClientGone:
+            p.cancel.set()
+            decision, actor = "cancelled", None
+
+        if decision == "cancelled" or p.cancel.is_set():
+            self.append_history({"ts": utc_stamp(), "id": p.id, "command": cmd,
+                                 "reason": p.reason, "status": "cancelled"})
+            log(f"{p.id}: cancelled")
+            return result({"ok": False, "status": "cancelled",
+                           "detail": "request cancelled (client disconnected "
+                                     "or 'cancel' command)"})
+        if decision is None:
+            self.append_history({"ts": utc_stamp(), "id": p.id, "command": cmd,
+                                 "reason": p.reason, "status": "expired"})
+            log(f"{p.id}: expired")
+            return result({"ok": False, "status": "expired",
+                           "detail": f"no decision within {cfg['wait_timeout_s']}s"})
+        if decision != "approve":
+            self.append_history({"ts": utc_stamp(), "id": p.id, "command": cmd,
+                                 "reason": p.reason, "status": "denied",
+                                 "approver": actor})
+            self.wh.send_notice(f"🚫 sudo {p.id} denied by {actor or 'user'}")
+            log(f"{p.id}: denied by {actor}")
+            return result({"ok": False, "status": "denied", "approver": actor})
+
+        # approved — execute as root
+        log(f"{p.id}: approved by {actor}, running as uid={os.getuid()}")
+        timeout = int(p.timeout_s or cfg["command_timeout_s"])
+        try:
+            proc = subprocess.run(p.argv, capture_output=True, text=True,
+                                  timeout=timeout, cwd="/", env=RUN_ENV)
+        except subprocess.TimeoutExpired:
+            self.append_history({"ts": utc_stamp(), "id": p.id, "command": cmd,
+                                 "reason": p.reason, "status": "timeout",
+                                 "approver": actor})
+            self.wh.send_notice(f"⏱ sudo {p.id} timed out after {timeout}s")
+            return result({"ok": False, "status": "timeout",
+                           "detail": f"command timed out after {timeout}s",
+                           "approver": actor})
+        except Exception as exc:
+            return result({"ok": False, "status": "error", "detail": str(exc),
+                           "approver": actor})
+
+        ok = proc.returncode == 0
+        self.append_history({"ts": utc_stamp(), "id": p.id, "command": cmd,
+                             "reason": p.reason, "status": "done",
+                             "exit_code": proc.returncode, "approver": actor,
+                             "source": "matrix"})
+        self.wh.send_notice(
+            f"{'✅' if ok else '❌'} sudo {p.id} finished: exit {proc.returncode}")
+        log(f"{p.id}: done, exit {proc.returncode}")
+        return result({
+            "ok": ok, "status": "done", "approver": actor,
+            "exit_code": proc.returncode,
+            "stdout": cap(proc.stdout, int(cfg["max_output_chars"])),
+            "stderr": cap(proc.stderr, int(cfg["max_output_chars"])),
+        })
+
+    # -- ops ----------------------------------------------------------------
+
+    def status(self) -> dict:
+        with self.lock:
+            pend = [{"id": p.id, "command": cmdline_of(p.argv),
+                     "reason": p.reason, "ts": p.ts}
+                    for p in self.pending.values()]
+        wh = {"url": self.cfg["webhooker_url"], "ok": False}
+        try:
+            me = self.wh.me()
+            wh.update({"ok": True, "bot": me.get("bot"),
+                       "bot_user": me.get("user"), "room": me.get("room")})
+        except Exception as exc:
+            wh["error"] = str(exc)
+        return {"running_as_uid": os.getuid(),
+                "socket": self.cfg["socket_path"],
+                "pending": pend,
+                "recent_history": self.tail_history(5),
+                "webhooker": wh}
+
+    def cancel(self, rid: str) -> dict:
+        if rid == "last" or not rid:
+            rid = self.last_id or ""
+        with self.lock:
+            p = self.pending.get(rid)
+        if p is None:
+            return {"ok": False, "status": "not_found",
+                    "detail": f"no pending request {rid!r}"}
+        p.cancel.set()
+        return {"ok": True, "status": "cancelled", "request_id": rid}
 
 
-def run_sudo(argv: list[str], password: str | None, timeout_s: int) -> subprocess.CompletedProcess:
-    sudo = shutil.which("sudo")
-    if not sudo:
-        raise RuntimeError("'sudo' not found on PATH")
-    if password is not None:
-        cmd = [sudo, "-S", "-p", ""] + argv
-        stdin_data = password + "\n"
-    else:
-        cmd = [sudo, "-n", "-p", ""] + argv  # -n: fail instead of prompting
-        stdin_data = None
+class Handler(socketserver.StreamRequestHandler):
+    timeout = 60
+
+    def reply(self, obj: dict) -> None:
+        self.wfile.write((json.dumps(obj) + "\n").encode())
+        self.wfile.flush()
+
+    def emit(self, event: dict) -> None:
+        """Stream an event; raise ClientGone if the client is gone."""
+        try:
+            self.reply(event)
+        except (BrokenPipeError, OSError):
+            raise ClientGone()
+
+    def handle(self) -> None:
+        app: Daemon = self.server.app
+        line = self.rfile.readline()
+        if not line:
+            return
+        try:
+            msg = json.loads(line)
+            op = msg.get("op")
+        except Exception:
+            self.reply({"result": {"ok": False, "status": "error",
+                                   "detail": "malformed request"}})
+            return
+        if op == "run":
+            self.handle_run(app, msg)
+        elif op == "status":
+            self.reply({"result": app.status()})
+        elif op == "history":
+            self.reply({"result": {"history": app.tail_history(
+                int(msg.get("n") or 10))}})
+        elif op == "cancel":
+            self.reply({"result": app.cancel(str(msg.get("id") or "last"))})
+        else:
+            self.reply({"result": {"ok": False, "status": "error",
+                                   "detail": f"unknown op {op!r}"}})
+
+    def handle_run(self, app: Daemon, msg: dict) -> None:
+        try:
+            argv = normalize_command(msg.get("command"))
+        except ValueError as exc:
+            self.reply({"result": {"ok": False, "status": "error",
+                                   "detail": str(exc)}})
+            return
+        request_id = ("s-" + datetime.now().strftime("%Y%m%d-%H%M%S")
+                      + "-" + os.urandom(2).hex())
+        p = PendingRequest(request_id, argv, str(msg.get("reason") or ""),
+                           msg.get("timeout_s"))
+        with app.lock:
+            if len(app.pending) >= int(app.cfg.get("max_pending") or 5):
+                self.reply({"result": {
+                    "ok": False, "status": "error",
+                    "detail": f"too many pending requests "
+                              f"(>= {app.cfg.get('max_pending')})"}})
+                return
+            app.pending[request_id] = p
+            app.last_id = request_id
+        try:
+            res = app.run_flow(p, self.emit)
+        except ClientGone:
+            p.cancel.set()
+            res = None  # nobody left to talk to
+        finally:
+            with app.lock:
+                app.pending.pop(request_id, None)
+        if res is not None:
+            self.reply({"result": res})
+
+
+class UnixServer(socketserver.ThreadingUnixStreamServer):
+    daemon_threads = True
+    allow_reuse_address = False
+
+
+def serve_daemon() -> None:
+    cfg = load_daemon_config()
+    app = Daemon(cfg)
+    path = Path(cfg["socket_path"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        try:
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            probe.connect(str(path))
+            probe.close()
+            raise SystemExit(f"another daemon is already listening on {path}")
+        except (ConnectionRefusedError, OSError):
+            path.unlink()
+    srv = UnixServer(str(path), Handler)
+    srv.app = app
+    os.chmod(str(path), 0o660)
+    grp = (cfg.get("socket_group") or "").strip()
+    if grp:
+        import grp as grpmod
+        try:
+            os.chown(str(path), 0, grpmod.getgrnam(grp).gr_gid)
+        except Exception as exc:
+            log(f"warning: could not chown socket to group {grp}: {exc}")
+    log(f"daemon up: uid={os.getuid()} socket={path} "
+        f"webhooker={cfg['webhooker_url']}")
     try:
-        return subprocess.run(
-            cmd, input=stdin_data, capture_output=True, text=True, timeout=timeout_s
-        )
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(f"command timed out after {timeout_s}s")
-
-
-def cap(text: str | None, limit: int) -> str:
-    text = text or ""
-    if len(text) <= limit:
-        return text
-    return text[:limit] + f"\n… [truncated {len(text) - limit} more chars]"
-
-
-def update_request(cfg: dict, request_id: str, **fields) -> None:
-    _, req_root = state_paths(cfg)
-    p = req_root / f"{request_id}.json"
-    rec = read_json(p) or {}
-    rec.update(fields)
-    rec["ts_updated"] = utc_stamp()
-    write_json(p, rec)
-
-
-def build_messages(rec: dict, request_id: str) -> tuple[str, str]:
-    cmd = cmdline_of(rec["command"])
-    reason = rec.get("reason") or "-"
-    esc = html.escape
-    plain = (
-        f"🔐 sudo request {request_id}\n"
-        f"command: {cmd}\n"
-        f"reason: {reason}\n"
-        "Reply: yes (approve) · no (deny)\n"
-        "Passwords are entered locally (desktop dialog or CLI), never in Matrix.\n"
-        f"Terminal: {PROJECT_DIR / 'mcp_server.py'} approve {request_id}"
-    )
-    body = (
-        f"🔐 <b>sudo request</b> <code>{esc(request_id)}</code><br>"
-        f"command: <code>{esc(cmd)}</code><br>"
-        f"<i>reason: {esc(reason)}</i><br>"
-        "Reply <b>yes</b> to approve, <b>no</b> to deny.<br>"
-        "If a password is needed you will be asked <b>locally</b> "
-        "(desktop dialog or CLI), never here."
-    )
-    return plain, body
+        srv.serve_forever()
+    finally:
+        srv.server_close()
+        path.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
-# tool implementations
+# user-side client (MCP forwarder + CLI)
 # ---------------------------------------------------------------------------
+
+
+def daemon_call(cfg: dict, msg: dict, on_event=None) -> dict:
+    path = cfg["socket_path"]
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.connect(path)
+    except (FileNotFoundError, ConnectionRefusedError, PermissionError) as exc:
+        return {"ok": False, "status": "error",
+                "detail": f"cannot reach the interactivesudo daemon at {path}: "
+                          f"{exc} — is 'systemctl start interactivesudo' done?"}
+    try:
+        f = s.makefile("rw", encoding="utf-8")
+        f.write(json.dumps(msg) + "\n")
+        f.flush()
+        while True:
+            line = f.readline()
+            if not line:
+                return {"ok": False, "status": "error",
+                        "detail": "daemon closed the connection"}
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if "event" in obj:
+                if on_event is not None:
+                    try:
+                        on_event(obj)
+                    except Exception:
+                        pass
+                continue
+            return obj.get("result") or {"ok": False, "status": "error",
+                                         "detail": "malformed daemon reply"}
+    finally:
+        s.close()
 
 
 def tool_sudo_run(command, reason: str = "", timeout_s=None) -> dict:
-    cfg = load_config()
-    t0 = time.monotonic()
-
+    cfg = load_user_config()
     try:
         argv = normalize_command(command)
     except ValueError as exc:
         return {"ok": False, "status": "error", "detail": str(exc)}
 
-    cmd_display = cmdline_of(argv)
-    joined = " ".join(argv)
-    for pattern in cfg.get("denylist") or []:
-        if pattern and pattern in joined:
-            return {
-                "ok": False,
-                "status": "refused_by_policy",
-                "detail": f"command matches denylist pattern {pattern!r} — "
-                          "denied without asking. Fix the command or adjust "
-                          "the denylist in config.json.",
-            }
+    def on_event(e: dict) -> None:
+        if not cfg.get("desktop_notify", True):
+            return
+        if e.get("event") == "pending":
+            desktop_notify(True, "InteractiveSudo — approval needed",
+                           f"{e.get('request_id')}: {e.get('command')}")
+        elif e.get("event") == "reminding":
+            desktop_notify(True, "InteractiveSudo — still waiting",
+                           f"{e.get('request_id')}: reply 👍/👎 in Matrix")
 
-    request_id = "s-" + datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(2).hex()
-    rec = {
-        "id": request_id,
-        "ts": utc_stamp(),
-        "command": argv,
-        "reason": reason or "",
-        "status": "waiting",
-        "password_provided": False,
-    }
-    _, req_root = state_paths(cfg)
-    write_json(req_root / f"{request_id}.json", rec)
-    (Path(cfg["state_dir"]) / "last_request").write_text(request_id + "\n")
-
-    def result(extra: dict) -> dict:
-        base = {
-            "ok": False,
-            "request_id": request_id,
-            "command": cmd_display,
-            "duration_s": round(time.monotonic() - t0, 2),
-        }
-        base.update(extra)
-        return base
-
-    # --- announce -------------------------------------------------------
-    wh: Webhooker | None = None
-    room_id: str | None = None
-    since_ts_ms = int(time.time() * 1000)
-    matrix_ok = False
-    try:
-        wh = Webhooker(cfg)
-        wh.me()  # validates api key, learns bot user id
-        plain, body_html = build_messages(rec, request_id)
-        sent = wh.send(plain, body_html)
-        room_id = sent.get("room")
-        since_ts_ms = int(time.time() * 1000)
-        matrix_ok = True
-    except Exception as exc:
-        matrix_ok = False
-        rec["matrix_announce_error"] = str(exc)
-    desktop_notify(cfg.get("desktop_notify", True),
-                   "InteractiveSudo — approval needed",
-                   f"{request_id}: {cmd_display}")
-
-    # --- approval round --------------------------------------------------
-    deadline = time.monotonic() + float(cfg["wait_timeout_s"])
-    gui_prompt(cfg, request_id, cmd_display, rec.get("reason", ""),
-               "approve", deadline)
-
-    remind_after = float(cfg.get("remind_after_s") or 0)
-    remind_at = time.monotonic() + remind_after if remind_after > 0 else None
-
-    def remind() -> None:
-        esc = html.escape
-        left = max(0, int(float(cfg["wait_timeout_s"]) - remind_after))
-        if wh and matrix_ok:
-            mxid = (cfg.get("remind_mxid") or "").strip()
-            mention = f"{mxid} " if mxid else ""
-            html_mention = (f'<a href="https://matrix.to/#/{esc(mxid)}">{esc(mxid)}</a> '
-                            if mxid else "")
-            wh.send(
-                f"🚨 {mention}sudo request {request_id} is still waiting "
-                f"({int(remind_after)}s): {cmd_display}\n"
-                f"Reply yes/no — it expires in {left}s.",
-                html_body=(
-                    f"🚨 {html_mention}<b>sudo {esc(request_id)}</b> still "
-                    f"waiting: <code>{esc(cmd_display)}</code><br>"
-                    f"Reply <b>yes</b>/<b>no</b> — expires in {left}s."
-                ),
-            )
-        desktop_notify(True, "InteractiveSudo — still waiting",
-                       f"{request_id}: {cmd_display}")
-
-    d = wait_for_decision(cfg, wh if matrix_ok else None,
-                          room_id if matrix_ok else None,
-                          since_ts_ms, deadline, request_id,
-                          remind_at_monotonic=remind_at, remind_cb=remind)
-    kill_dialogs(request_id)
-    if d is None:
-        _, req_root = state_paths(cfg)
-        (req_root / request_id / "decision.json").unlink(missing_ok=True)
-        update_request(cfg, request_id, status="expired",
-                       detail="no decision before timeout")
-        append_history(cfg, {"ts": utc_stamp(), "id": request_id,
-                             "command": cmd_display, "reason": reason,
-                             "status": "expired"})
-        extra = ("" if matrix_ok
-                 else f" (matrix announce failed: {rec.get('matrix_announce_error')})")
-        return result({"status": "expired",
-                       "detail": f"no decision within {cfg['wait_timeout_s']}s{extra}"})
-
-    if d["decision"] != "approve":
-        update_request(cfg, request_id, status="denied", approver=d.get("actor"),
-                       source=d.get("source"))
-        append_history(cfg, {"ts": utc_stamp(), "id": request_id,
-                             "command": cmd_display, "reason": reason,
-                             "status": "denied", "approver": d.get("actor"),
-                             "source": d.get("source")})
-        if wh and matrix_ok:
-            wh.send_notice(f"🚫 sudo {request_id} denied by {d.get('actor') or 'user'}")
-        return result({"status": "denied", "approver": d.get("actor")})
-
-    # approved
-    timeout = int(timeout_s or cfg["command_timeout_s"])
-    password = d.get("password") or cached_password(cfg)
-    rec["password_provided"] = bool(password)
-
-    proc: subprocess.CompletedProcess | None = None
-    if password:
-        try:
-            proc = run_sudo(argv, password, timeout)
-        except RuntimeError as exc:
-            proc = None
-            detail = str(exc)
-        if proc is not None and proc.returncode == 0:
-            remember_password(cfg, password)
-        else:
-            detail = cap((proc.stderr if proc else "") or "failed", 2000)
-    else:
-        try:
-            proc = run_sudo(argv, None, timeout)  # sudo -n
-        except RuntimeError as exc:
-            return result({"status": "error", "detail": str(exc)})
-        if proc.returncode == 0:
-            pass
-        else:
-            # needs a password — second round (local entry only)
-            proc = None
-            detail = None
-            deadline = time.monotonic() + float(cfg["password_ask_timeout_s"])
-            dialog_open = gui_prompt(cfg, request_id, cmd_display,
-                                     rec.get("reason", ""), "password", deadline)
-            if wh and matrix_ok:
-                local_how = ("Enter it in the desktop dialog that just opened, or run"
-                             if dialog_open else
-                             "No desktop dialog available — run this in a terminal:")
-                wh.send(
-                    f"🔐 sudo {request_id} was approved but needs a password.\n"
-                    f"command: {cmd_display}\n"
-                    f"{local_how}\n"
-                    f"  {PROJECT_DIR / 'mcp_server.py'} approve {request_id}\n"
-                    "Reply 'no' here to abort. (Passwords are never sent "
-                    "over Matrix.)"
-                )
-            desktop_notify(cfg.get("desktop_notify", True),
-                           "InteractiveSudo — password needed",
-                           f"{request_id}: {cmd_display}")
-            d2 = wait_for_decision(cfg, wh if matrix_ok else None,
-                                   room_id if matrix_ok else None,
-                                   int(time.time() * 1000), deadline, request_id,
-                                   require_password=True)
-            kill_dialogs(request_id)
-            if d2 is None or d2["decision"] != "approve" or not d2.get("password"):
-                update_request(cfg, request_id, status="denied",
-                               detail="no password provided")
-                append_history(cfg, {"ts": utc_stamp(), "id": request_id,
-                                     "command": cmd_display, "reason": reason,
-                                     "status": "denied", "detail": "no password"})
-                return result({"status": "denied",
-                               "detail": "approved, but no password was provided"})
-            password = d2["password"]
-            rec["password_provided"] = True
-            try:
-                proc = run_sudo(argv, password, timeout)
-            except RuntimeError as exc:
-                return result({"status": "error", "detail": str(exc)})
-            if proc.returncode == 0:
-                remember_password(cfg, password)
-
-    if proc is None:
-        status = "denied" if detail is None else "failed"
-        update_request(cfg, request_id, status=status, detail=detail)
-        append_history(cfg, {"ts": utc_stamp(), "id": request_id,
-                             "command": cmd_display, "reason": reason,
-                             "status": status})
-        return result({"status": status, "detail": detail})
-
-    ok = proc.returncode == 0
-    update_request(cfg, request_id, status="done", ok=ok,
-                   exit_code=proc.returncode, approver=d.get("actor"),
-                   source=d.get("source"))
-    append_history(cfg, {"ts": utc_stamp(), "id": request_id,
-                         "command": cmd_display, "reason": reason,
-                         "status": "done", "exit_code": proc.returncode,
-                         "approver": d.get("actor"), "source": d.get("source"),
-                         "password_provided": bool(password)})
-    if wh and matrix_ok:
-        wh.send_notice(
-            f"{'✅' if ok else '❌'} sudo {request_id} finished: exit {proc.returncode}"
-        )
-    return result({
-        "ok": ok,
-        "status": "done",
-        "approver": d.get("actor"),
-        "exit_code": proc.returncode,
-        "stdout": cap(proc.stdout, int(cfg["max_output_chars"])),
-        "stderr": cap(proc.stderr, int(cfg["max_output_chars"])),
-    })
+    return daemon_call(cfg, {"op": "run", "command": argv,
+                             "reason": reason or "", "timeout_s": timeout_s},
+                       on_event)
 
 
 def tool_sudo_status() -> dict:
-    cfg = load_config()
-    out: dict = {
-        "project_dir": str(PROJECT_DIR),
-        "state_dir": cfg["state_dir"],
-        "bot": cfg["bot_name"],
-        "password_cached": cached_password(cfg) is not None,
-        "pending": pending_requests(cfg),
-        "recent_history": tail_history(cfg, 5),
-    }
-    try:
-        wh = Webhooker(cfg)
-        me = wh.me()
-        out["webhooker"] = {
-            "url": cfg["webhooker_url"],
-            "ok": True,
-            "bot": me.get("bot"),
-            "bot_user": me.get("user"),
-            "room": me.get("room"),
-        }
-    except Exception as exc:
-        out["webhooker"] = {"url": cfg["webhooker_url"], "ok": False, "error": str(exc)}
-    return out
+    return daemon_call(load_user_config(), {"op": "status"})
 
 
 # ---------------------------------------------------------------------------
-# MCP server
+# MCP server (user-side)
 # ---------------------------------------------------------------------------
 
 
 def serve() -> None:
-    import logging
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("httpcore").setLevel(logging.WARNING)
     from mcp.server.fastmcp import FastMCP
 
     mcp = FastMCP(
         "interactive-sudo",
         instructions=(
-            "Human-in-the-loop sudo. Use sudo_run for ANY command that needs root. "
-            "The user is asked in Matrix (and via a desktop dialog) and must reply "
-            "'yes' before anything runs. Passwords are entered locally by the user "
-            "(desktop dialog or CLI) — never via Matrix, and never by you. Put a "
-            "short human-readable reason in every call. Never put secrets or "
-            "passwords in 'reason'."
+            "Human-in-the-loop root. Use sudo_run for ANY command that needs "
+            "root. The user is asked in Matrix and must reply 👍/yes to "
+            "approve (👎/no denies); nothing else counts. There are no "
+            "passwords — a root daemon executes the command after approval. "
+            "Put a short human-readable reason in every call. Never put "
+            "secrets in 'reason'."
         ),
     )
 
     @mcp.tool()
     def sudo_run(command: str | list[str], reason: str = "",
                  timeout_s: int | None = None) -> dict:
-        """Run a command via sudo after interactive human approval.
+        """Run a command as root after interactive human approval.
 
-        The request is announced in the user's Matrix room and as a desktop
-        dialog; the user must reply 'yes' (or click Approve) to approve, 'no'
-        (or click Deny) to deny. If sudo needs a password the user enters it
-        locally — never through chat. Returns ok, exit_code, stdout, stderr.
+        The request is announced in the user's Matrix room; the user must
+        reply 👍/yes to approve or 👎/no to deny. If the user does not
+        decide within the timeout, the request expires. Returns ok,
+        exit_code, stdout, stderr.
 
         Args:
             command: argv list (preferred) or shell string.
@@ -860,62 +753,39 @@ def serve() -> None:
 
     @mcp.tool()
     def sudo_status() -> dict:
-        """Webhooker health, pending requests, cached-password state, recent history."""
+        """Daemon health, pending requests, recent history."""
         return tool_sudo_status()
 
     mcp.run(transport="stdio")
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# CLI (user side)
 # ---------------------------------------------------------------------------
 
 
-def cmd_serve(_args) -> int:
-    serve()
-    return 0
-
-
-def cmd_approve(args) -> int:
-    cfg = load_config()
-    rid = resolve_request_id(cfg, args.id)
-    password = None
-    try:
-        import getpass
-        password = getpass.getpass(f"password for {rid} (blank = none): ") or None
-    except (EOFError, KeyboardInterrupt):
-        password = None
-    set_decision(cfg, rid, "approve", password, os.environ.get("USER", "cli"))
-    print(f"approved {rid}" + ("" if password else " (no password)"))
-    return 0
-
-
-def cmd_deny(args) -> int:
-    cfg = load_config()
-    rid = resolve_request_id(cfg, args.id)
-    set_decision(cfg, rid, "deny", None, os.environ.get("USER", "cli"))
-    print(f"denied {rid}")
-    return 0
-
-
 def cmd_status(_args) -> int:
-    cfg = load_config()
-    print(f"project : {PROJECT_DIR}")
-    print(f"state   : {cfg['state_dir']}")
-    try:
-        wh = Webhooker(cfg)
-        me = wh.me()
-        print(f"webhooker: OK  bot={me.get('bot')} user={me.get('user')} room={me.get('room')}")
-    except Exception as exc:
-        print(f"webhooker: FAIL ({exc})")
-    pend = pending_requests(cfg)
+    cfg = load_user_config()
+    print(f"socket  : {cfg['socket_path']}")
+    st = daemon_call(cfg, {"op": "status"})
+    if st.get("status") == "error":
+        print(st["detail"])
+        return 1
+    print(f"daemon  : uid={st.get('running_as_uid')} socket={st.get('socket')}")
+    wh = st.get("webhooker", {})
+    if wh.get("ok"):
+        print(f"webhooker: OK  bot={wh.get('bot')} user={wh.get('bot_user')} "
+              f"room={wh.get('room')}")
+    else:
+        print(f"webhooker: FAIL ({wh.get('error')})")
+    pend = st.get("pending") or []
     if pend:
         print("pending requests:")
         for r in pend:
-            print(f"  {r['id']}  {cmdline_of(r['command'])}  (since {r.get('ts')})")
+            print(f"  {r['id']}  {r['command']}  (since {r.get('ts')})")
     else:
         print("pending requests: none")
-    hist = tail_history(cfg, 5)
+    hist = st.get("recent_history") or []
     if hist:
         print("recent:")
         for h in hist:
@@ -927,36 +797,45 @@ def cmd_status(_args) -> int:
 
 
 def cmd_history(args) -> int:
-    for h in tail_history(load_config(), args.n):
+    res = daemon_call(load_user_config(), {"op": "history", "n": args.n})
+    for h in res.get("history") or []:
         print(json.dumps(h, ensure_ascii=False))
     return 0
+
+
+def cmd_cancel(args) -> int:
+    res = daemon_call(load_user_config(), {"op": "cancel", "id": args.id})
+    if res.get("ok"):
+        print(f"cancelled {res.get('request_id')}")
+        return 0
+    print(res.get("detail") or json.dumps(res))
+    return 1
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
         prog="mcp_server.py",
-        description="InteractiveSudoMCP — human-in-the-loop sudo for coding agents.",
+        description="InteractiveSudoMCP — human-in-the-loop root for agents.",
     )
     sub = parser.add_subparsers(dest="cmd")
     sub.add_parser("serve", help="run the MCP stdio server (default)")
-    p_app = sub.add_parser("approve", help="approve a pending request "
-                                           "(password via getpass only)")
-    p_app.add_argument("id", nargs="?", default="last")
-    p_den = sub.add_parser("deny", help="deny a pending request")
-    p_den.add_argument("id", nargs="?", default="last")
-    sub.add_parser("status", help="show pending requests + health")
+    sub.add_parser("daemon", help="run the root daemon (used by systemd)")
+    sub.add_parser("status", help="daemon status + recent history")
     p_hist = sub.add_parser("history", help="show recent requests")
     p_hist.add_argument("-n", type=int, default=10)
+    p_can = sub.add_parser("cancel", help="cancel a pending request")
+    p_can.add_argument("id", nargs="?", default="last")
     args = parser.parse_args()
     args.cmd = args.cmd or "serve"
     handlers = {
-        "serve": cmd_serve,
-        "approve": cmd_approve,
-        "deny": cmd_deny,
+        "serve": lambda _a: serve(),
+        "daemon": lambda _a: serve_daemon(),
         "status": cmd_status,
         "history": cmd_history,
+        "cancel": cmd_cancel,
     }
-    return handlers[args.cmd](args)
+    handlers[args.cmd](args)
+    return 0
 
 
 if __name__ == "__main__":
