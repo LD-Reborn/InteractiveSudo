@@ -116,6 +116,10 @@ DENY_WORDS = {
     "nein", "abbrechen", "ablehnen", "ablehne", "👎", "👎🏼", "👎🏽",
 }
 
+# Reactions on the request/reminder message itself also decide.
+REACTION_APPROVE = {"👍", "👍🏼", "👍🏽", "👍🏾", "👍🏿", "✅", "✔️"}
+REACTION_DENY = {"👎", "👎🏼", "👎🏽", "👎🏾", "👎🏿", "❌", "✖️", "🚫"}
+
 
 # ---------------------------------------------------------------------------
 # config
@@ -332,17 +336,19 @@ class Daemon:
             f"🔐 sudo request {request_id}\n"
             f"command: {cmd}\n"
             f"reason: {reason or '-'}\n"
-            "Reply 👍 (or yes) to approve · 👎 (or no) to deny"
+            "React 👍 on this message to approve · 👎 to deny\n"
+            "(or reply: yes / no)"
         )
         body = (
             f"🔐 <b>sudo request</b> <code>{esc(request_id)}</code><br>"
             f"command: <code>{esc(cmd)}</code><br>"
             f"<i>reason: {esc(reason or '-')}</i><br>"
-            "Reply <b>👍</b>/<b>yes</b> to approve, <b>👎</b>/<b>no</b> to deny."
+            "React <b>👍</b> on this message to approve, <b>👎</b> to deny "
+            "(or reply <b>yes</b>/<b>no</b>)."
         )
         return plain, body
 
-    def send_reminder(self, p: PendingRequest) -> None:
+    def send_reminder(self, p: PendingRequest) -> str | None:
         cfg = self.cfg
         esc = html.escape
         cmd = cmdline_of(p.argv)
@@ -353,7 +359,7 @@ class Daemon:
         html_mention = (f'<a href="https://matrix.to/#/{esc(mxid)}">{esc(mxid)}</a> '
                         if mxid else "")
         try:
-            self.wh.send(
+            resp = self.wh.send(
                 f"🚨 {mention}sudo request {p.id} is still waiting: {cmd}\n"
                 f"Reply 👍/yes or 👎/no — it expires in {left}s.",
                 html_body=(
@@ -363,14 +369,18 @@ class Daemon:
                 ),
             )
             log(f"{p.id}: reminder ping sent")
+            return resp.get("event_id")
         except Exception as exc:
             log(f"{p.id}: reminder ping failed: {exc}")
+            return None
 
     def wait_matrix(self, p: PendingRequest, room_id: str, since_ts_ms: int,
-                    deadline: float, remind_at: float | None,
-                    emit) -> tuple[str | None, str | None]:
-        """Poll the room for 👍/👎. Returns (decision, actor) or (None, None).
+                    deadline: float, remind_at: float | None, emit,
+                    watch_ids: set[str]) -> tuple[str | None, str | None]:
+        """Poll the room for a decision. Returns (decision, actor) or (None, None).
 
+        Decisions: a text reply (yes/no/…), or a 👍/👎 reaction on one of
+        watch_ids (this request's announcement or reminder message).
         Raises ClientGone if the requesting client disconnects (emit fails).
         """
         interval = float(self.cfg["poll_interval_s"])
@@ -383,11 +393,23 @@ class Daemon:
                     ts = m.get("ts") or 0
                     if ts < since_ts_ms - 3000:
                         continue
-                    decision, _ = parse_reply(m.get("body", ""))
-                    if decision is None:
-                        continue
-                    # One decision message approves/denies exactly one request.
-                    key = m.get("id") or f"{ts}:{m.get('sender')}:{m.get('body')}"
+                    if m.get("type") == "m.reaction":
+                        if m.get("reacts_to") not in watch_ids:
+                            continue  # reaction to some other message
+                        rkey = (m.get("key") or "").strip()
+                        if rkey in REACTION_APPROVE:
+                            decision = "approve"
+                        elif rkey in REACTION_DENY:
+                            decision = "deny"
+                        else:
+                            continue
+                    else:
+                        decision, _ = parse_reply(m.get("body", ""))
+                        if decision is None:
+                            continue
+                    # One decision event approves/denies exactly one request.
+                    key = (m.get("event_id")
+                           or f"{ts}:{m.get('sender')}:{m.get('body') or m.get('key')}")
                     with self.lock:
                         if key in self.claimed:
                             continue
@@ -400,7 +422,9 @@ class Daemon:
             now = time.monotonic()
             if remind_at is not None and not reminded and now >= remind_at:
                 reminded = True
-                self.send_reminder(p)
+                rid = self.send_reminder(p)
+                if rid:
+                    watch_ids.add(rid)
                 emit({"event": "reminding", "request_id": p.id})
             if now >= deadline:
                 return None, None
@@ -436,6 +460,7 @@ class Daemon:
             plain, body_html = self.announce_text(p.id, cmd, p.reason)
             sent = self.wh.send(plain, body_html)
             room_id = sent.get("room") or me.get("room")
+            watch_ids = {sent.get("event_id")} - {None, ""}
             since_ts_ms = int(time.time() * 1000)
         except Exception as exc:
             return result({"ok": False, "status": "error",
@@ -449,7 +474,8 @@ class Daemon:
         remind_at = time.monotonic() + remind_after if remind_after > 0 else None
         try:
             decision, actor = self.wait_matrix(p, room_id, since_ts_ms,
-                                               deadline, remind_at, emit)
+                                               deadline, remind_at, emit,
+                                               watch_ids)
         except ClientGone:
             p.cancel.set()
             decision, actor = "cancelled", None
@@ -726,11 +752,11 @@ def serve() -> None:
         "interactive-sudo",
         instructions=(
             "Human-in-the-loop root. Use sudo_run for ANY command that needs "
-            "root. The user is asked in Matrix and must reply 👍/yes to "
-            "approve (👎/no denies); nothing else counts. There are no "
-            "passwords — a root daemon executes the command after approval. "
-            "Put a short human-readable reason in every call. Never put "
-            "secrets in 'reason'."
+            "root. The user is asked in Matrix and must react 👍 on the "
+            "request message (or reply yes) to approve; 👎/no denies. "
+            "Nothing else counts. There are no passwords — a root daemon "
+            "executes the command after approval. Put a short human-readable "
+            "reason in every call. Never put secrets in 'reason'."
         ),
     )
 
@@ -739,10 +765,10 @@ def serve() -> None:
                  timeout_s: int | None = None) -> dict:
         """Run a command as root after interactive human approval.
 
-        The request is announced in the user's Matrix room; the user must
-        reply 👍/yes to approve or 👎/no to deny. If the user does not
-        decide within the timeout, the request expires. Returns ok,
-        exit_code, stdout, stderr.
+        The request is announced in the user's Matrix room; the user reacts
+        👍 on the request message (or replies yes) to approve, 👎/no to
+        deny. If the user does not decide within the timeout, the request
+        expires. Returns ok, exit_code, stdout, stderr.
 
         Args:
             command: argv list (preferred) or shell string.

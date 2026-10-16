@@ -40,7 +40,8 @@ would be forgeable by a compromised account**. So approval comes only from
 Matrix, out-of-band from this machine.
 
 Verified properties (live-tested):
-- 👍/`yes` from your account approves; 👎/`no` denies; anything else is ignored.
+- 👍 reaction on the request/reminder message, or `yes`/`ja` text, approves;
+  👎/`no` denies; anything else is ignored.
 - The **bot's own 👍 is ignored** — a local process cannot self-approve.
 - Closing the connection (agent gave up) **cancels** the request.
 - `cancel last` from a terminal cancels a pending request.
@@ -57,11 +58,12 @@ string is also accepted (runs through `sh -c` — you approve exactly that strin
 
 ## Approving
 
-Reply in the bot's Matrix room: **👍** or `yes`/`ja`/`ok` … to approve,
-**👎** or `no`/`nein`/`abort` … to deny. Nothing else counts. If nobody
-decides within `wait_timeout_s` (default 600s) the request expires; at
-`remind_after_s` (default 300s) the bot sends a **mention** (pushes your
-phone) and the desktop notification re-fires.
+React **👍** on the request message (or the 🚨 reminder) to approve,
+**👎** to deny — or reply in the room: `yes`/`ja`/`ok` … approve,
+`no`/`nein`/`abort` … deny. Nothing else counts. If nobody decides within
+`wait_timeout_s` (default 600s) the request expires; at `remind_after_s`
+(default 300s) the bot sends a **mention** (pushes your phone) and the
+desktop notification re-fires.
 
 CLI (user side, no approval possible by design):
 
