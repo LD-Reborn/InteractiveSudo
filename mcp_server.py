@@ -117,8 +117,14 @@ DENY_WORDS = {
 }
 
 # Reactions on the request/reminder message itself also decide.
-REACTION_APPROVE = {"👍", "👍🏼", "👍🏽", "👍🏾", "👍🏿", "✅", "✔️"}
-REACTION_DENY = {"👎", "👎🏼", "👎🏽", "👎🏾", "👎🏿", "❌", "✖️", "🚫"}
+# Keys are normalized: U+FE0F (emoji variation selector, sent by e.g.
+# Element as "👍️") is stripped before matching.
+REACTION_APPROVE = {"👍", "👍🏼", "👍🏽", "👍🏾", "👍🏿", "✅", "✔"}
+REACTION_DENY = {"👎", "👎🏼", "👎🏽", "👎🏾", "👎🏿", "❌", "✖", "🚫"}
+
+
+def norm_emoji(key: str) -> str:
+    return key.strip().replace("\ufe0f", "")
 
 
 # ---------------------------------------------------------------------------
@@ -182,7 +188,7 @@ def parse_reply(raw: str) -> tuple[str | None, bool]:
 
     decision is "approve" | "deny" | None (not a decision).
     """
-    text = (raw or "").strip().strip("`").strip()
+    text = (raw or "").strip().strip("`").strip().replace("\ufe0f", "")
     if not text:
         return None, False
     words = [w.lower().rstrip("!.") for w in text.split()]
@@ -396,7 +402,7 @@ class Daemon:
                     if m.get("type") == "m.reaction":
                         if m.get("reacts_to") not in watch_ids:
                             continue  # reaction to some other message
-                        rkey = (m.get("key") or "").strip()
+                        rkey = norm_emoji(m.get("key") or "")
                         if rkey in REACTION_APPROVE:
                             decision = "approve"
                         elif rkey in REACTION_DENY:
