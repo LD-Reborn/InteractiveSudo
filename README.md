@@ -93,10 +93,10 @@ cd ~/.config/InteractiveSudo
 Check: `systemctl status interactivesudo`, `journalctl -u interactivesudo -f`,
 then `python3 mcp_server.py status`.
 
-**Important:** the old `secrets/api_key` sat in a cloud-synced folder (pushed to
-the server and all devices). `install.sh` imports it to `/etc` and tells you
-to delete the project copy — and you should **rotate the key** in
-MatrixWebhooker afterwards.
+**Important:** never keep `secrets/api_key` inside a synced or backed-up
+folder (cloud sync pushes it to servers and all your devices). `install.sh`
+imports it to `/etc` and tells you to delete the project copy — and you
+should **rotate the key** in MatrixWebhooker afterwards.
 
 ## Configuration
 

@@ -80,7 +80,7 @@ DAEMON_DEFAULTS: dict = {
     "bot_name": "mybot",
     "api_key_file": "/etc/interactivesudo/api_key",
     "socket_path": "/run/interactivesudo/agent.sock",
-    "socket_group": "operator",     # group allowed to talk to the daemon
+    "socket_group": "operator",    # group allowed to talk to the daemon
     "state_dir": "/var/lib/interactivesudo",
     "poll_interval_s": 1.5,
     "wait_timeout_s": 600,          # how long to wait for 👍/👎
