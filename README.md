@@ -11,7 +11,7 @@ agent's context, not in any log.
 
 | Part | Runs as | What it does |
 |---|---|---|
-| **Root daemon** (`mcp_server.py daemon`, systemd) | root | Denylist → registers request with the relay over WSS (PSK) → posts a one-time link in Matrix → waits → decrypts the approval, verifies your password (`chpasswd -c`) → executes as root → history. |
+| **Root daemon** (`mcp_server.py daemon`, systemd) | root | Denylist → registers request with the relay over WSS (PSK) → posts a one-time link in Matrix → waits → decrypts the approval, verifies your password (`pam_check`, PAM) → executes as root → history. |
 | **Approval relay** (`approve_server.py`, your public host) | non-root user, behind nginx/TLS | Blind relay: serves the approval page, forwards E2EE ciphertext to the daemon's open WSS. Cannot read passwords/secrets, keeps no state on disk. Stdlib-only. |
 | **MCP server** (`mcp_server.py serve`, started by the agent) | you | Thin forwarder over a Unix socket + desktop notifications. No secrets. |
 
@@ -26,7 +26,7 @@ agent ──sudo_run(cmd, reason, secret_vars)──▶ MCP forwarder ──unix
    you ── open link ──▶ relay page ── GET meta (Bearer token) ────────────┤
        reads command/reason/secrets, types password ──▶ RSA-OAEP+AES-GCM │ 4. relay forwards ciphertext
                                                                         │    over the already-open WSS
-                                                                        │ 5. decrypt, chpasswd -c (shadow/PAM)
+                                                                        │ 5. decrypt, PAM verify (pam_check)
                                                                         │ 6. run as root (argv, cwd=/, min env,
                                                                         │    secrets injected, output scrubbed)
                                                                         ▼
@@ -139,10 +139,18 @@ Client (`config.json` next to `mcp_server.py`): `socket_path`,
 ## Security model
 
 - Approval = one-time URL (possession) **and** your password (knowledge),
-  verified against shadow/PAM via `chpasswd -c` inside the root daemon.
+  verified against PAM (service `sudo`) via the small `pam_check` C helper
+  inside the root daemon.
 - Password + named secrets: per-request ephemeral RSA-2048 keypair, browser
   encrypts (WebCrypto RSA-OAEP + AES-256-GCM); the relay only ever handles
   opaque ciphertext; nothing touches disk or logs; output is scrubbed.
+- Result channel (v3.1): the page generates a second ephemeral RSA keypair;
+  after execution the daemon seals exit code + output tails back to it, so
+  the page can show the outcome in a collapsible panel — the relay stores
+  ciphertext only. The private key lives in that browser's localStorage
+  (per link token), so the same browser can re-open an old link and still
+  decrypt; other browsers see "result exists" but cannot read it. Disable
+  with `"report_results": false` in the daemon config.
 - The token lives in the URL **fragment** — browsers never send fragments,
   so nginx access logs, `Referer` and Matrix link-preview crawlers cannot
   see it. The page strips it from the address bar after loading.

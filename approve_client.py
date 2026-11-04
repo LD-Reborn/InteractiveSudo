@@ -20,6 +20,7 @@ import base64
 import json
 import os
 import queue
+import secrets
 import socket
 import ssl
 import struct
@@ -78,6 +79,28 @@ def open_payload(key, ek_b64: str, iv_b64: str, ct_b64: str) -> dict:
     if not isinstance(obj, dict) or obj.get("v") != 1:
         raise ChannelError("unexpected payload version")
     return obj
+
+
+def seal_payload(spki_b64: str, obj: dict) -> dict:
+    """Inverse of open_payload: encrypt obj to a page-generated RSA public
+    key (SPKI base64url). Used for the E2EE result channel (exit code +
+    output travel as ciphertext; the relay only sees opaque bytes)."""
+    def b64u(raw: bytes) -> str:
+        return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+    key = serialization.load_der_public_key(b64url_decode_padded(spki_b64))
+    aes_key = secrets.token_bytes(32)
+    iv = secrets.token_bytes(12)
+    ct = AESGCM(aes_key).encrypt(iv, json.dumps(obj).encode("utf-8"), None)
+    ek = key.encrypt(
+        aes_key,
+        padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                     algorithm=hashes.SHA256(), label=None))
+    return {"ek": b64u(ek), "iv": b64u(iv), "ct": b64u(ct)}
+
+
+def b64url_decode_padded(s: str) -> bytes:
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
 
 
 # ---------------------------------------------------------------------------
@@ -305,9 +328,12 @@ class ApproveChannel(threading.Thread):
     def done(self, rid: str) -> None:
         self._pending.pop(rid, None)
 
-    def report(self, rid: str, status: str) -> None:
+    def report(self, rid: str, status: str, payload: dict | None = None) -> None:
         try:
-            self._send({"op": "result", "id": rid, "status": status})
+            msg = {"op": "result", "id": rid, "status": status}
+            if payload:
+                msg["payload"] = payload
+            self._send(msg)
         except ChannelError:
             pass
 

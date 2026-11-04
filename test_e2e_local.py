@@ -23,7 +23,7 @@ sys.path.insert(0, HERE)
 
 import approve_server  # noqa: E402
 from approve_client import (ApproveChannel, ChannelError,  # noqa: E402
-                            generate_request_key, open_payload)
+                            generate_request_key, open_payload, seal_payload)
 
 PSK = "test-psk-1234567890"
 PORT = 8099
@@ -192,6 +192,40 @@ def main() -> int:
     check("deny 200", st == 200)
     ev = ch.wait("s-e2e-3", 5)
     check("deny on channel", ev and ev.get("decision") == "deny")
+
+    print("== 5b. sealed result channel (exit code + output) ==")
+    from cryptography.hazmat.primitives.asymmetric import rsa, padding
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    urlr, _ = ch.register("s-e2e-r", "true", "result test", [], 300)
+    tokr = urlr.split("/r/")[1]
+    rk = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    spki = b64u(rk.public_key().public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo))
+    summary = {"status": "done", "command": "true", "exit_code": 0,
+               "stdout": "hello ergebnis", "stderr": ""}
+    sealed = seal_payload(spki, summary)
+    ch.report("s-e2e-r", "executing")     # exec-hold extends the TTL …
+    time.sleep(0.3)
+    st, r = api("/api/v1/request/status", tokr)
+    check("executing extends hold",
+          st == 200 and r.get("expires_in", 0) > 600)
+    ch.report("s-e2e-r", "done", payload=sealed)
+    st, r = api("/api/v1/request/status", tokr)
+    check("status ok + has_result",
+          st == 200 and r.get("state") == "ok" and r.get("has_result"))
+    st, r = api("/api/v1/request/result", tokr)
+    check("result endpoint serves sealed blob", st == 200 and bool(r.get("ct")))
+    aes = rk.decrypt(
+        base64.urlsafe_b64decode(blob_pubkey_pad(r["ek"])),
+        padding.OAEP(mgf=padding.MGF1(hashes.SHA256()),
+                     algorithm=hashes.SHA256(), label=None))
+    d = json.loads(AESGCM(aes).decrypt(
+        base64.urlsafe_b64decode(blob_pubkey_pad(r["iv"])),
+        base64.urlsafe_b64decode(blob_pubkey_pad(r["ct"])), None))
+    check("result roundtrip (exit+stdout)",
+          d.get("exit_code") == 0 and "hello ergebnis" in d.get("stdout", ""))
 
     print("== 6. expiry ==")
     url4, _ = ch.register("s-e2e-4", "sleep 999", "expiry test", [], 300)

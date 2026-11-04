@@ -41,7 +41,7 @@ How it works (URL approval, the default)
    command will receive, type your sudo password, and approve. The
    browser encrypts {password, secrets} with the request's ephemeral key
    (RSA-OAEP + AES-256-GCM); the relay forwards ciphertext it cannot read.
-4. The daemon verifies your password (chpasswd -c, shadow/PAM — never
+4. The daemon verifies your password (PAM service sudo via pam_check — never
    stored, never logged, scrubbed from command output) and executes.
 5. 👍/yes in Matrix are IGNORED for approval (the old channel's single-
    factor weakness); 👎/no on the message stays a deny-only emergency
@@ -54,7 +54,7 @@ Security model
 --------------
 - Approval requires possession (single-use URL token, short TTL, single
   endpoint registration, rate limits) AND knowledge (your sudo password,
-  verified via chpasswd -c). The bot's own messages are ignored; there are
+  verified via PAM/pam_check). The bot's own messages are ignored; there are
   no local approval channels — a compromised user account cannot approve.
 - The password and named secrets travel only inside per-request E2EE
   blobs; they never enter chat, agent context, the relay, or logs, and
@@ -114,6 +114,7 @@ DAEMON_DEFAULTS: dict = {
     "approve_ttl_s": 300,           # link lifetime; also the wait deadline
     "approve_remind_s": 180,        # Matrix mention ping (0 = off)
     "fallback_matrix_approve": False,  # allow legacy 👍 if relay is down
+    "report_results": True,            # E2EE exit code + output to the page
     "denylist": [
         "mkfs",
         "dd if=",
@@ -380,6 +381,9 @@ class PendingRequest:
         self.secret_names = secret_names or []
         self.ts = utc_stamp()
         self.cancel = threading.Event()
+        # base64url SPKI of the page's ephemeral result key (set from the
+        # approval blob when the page supports the E2EE result channel)
+        self.result_ek = ""
 
 
 class Daemon:
@@ -601,6 +605,13 @@ class Daemon:
         env = dict(RUN_ENV)
         env.update(secrets_d)
         log(f"{p.id}: approved ({approver}), running as uid={os.getuid()}")
+        if getattr(p, "result_ek", ""):
+            # page awaits the final result: extend its hold, then report
+            try:
+                if self.channel and self.channel.connected():
+                    self.channel.report(p.id, "executing")
+            except Exception:
+                pass
         try:
             proc = subprocess.run(p.argv, capture_output=True, text=True,
                                   timeout=timeout, cwd="/", env=env)
@@ -610,10 +621,17 @@ class Daemon:
                                  "approver": approver, "scope": scope,
                                  "source": source})
             self.wh.send_notice(f"⏱ sudo {p.id} timed out after {timeout}s")
+            self._send_page_result(p, {"status": "timeout", "command": cmd,
+                                       "exit_code": None,
+                                       "stdout": "",
+                                       "stderr": f"timed out after {timeout}s"})
             return result({"ok": False, "status": "timeout",
                            "detail": f"command timed out after {timeout}s",
                            "approver": approver})
         except Exception as exc:
+            self._send_page_result(p, {"status": "error", "command": cmd,
+                                       "exit_code": None, "stdout": "",
+                                       "stderr": str(exc)[:2000]})
             return result({"ok": False, "status": "error", "detail": str(exc),
                            "approver": approver})
 
@@ -627,12 +645,33 @@ class Daemon:
             f"{proc.returncode}")
         log(f"{p.id}: done, exit {proc.returncode}")
         limit = int(cfg["max_output_chars"])
+        out = self.scrub(cap(proc.stdout, limit), secrets_d, password)
+        err = self.scrub(cap(proc.stderr, limit), secrets_d, password)
+        self._send_page_result(p, {"status": "done", "command": cmd,
+                                   "exit_code": proc.returncode,
+                                   "stdout": cap(out, 3500),
+                                   "stderr": cap(err, 3500)})
         return result({
             "ok": ok, "status": "done", "approver": approver, "scope": scope,
-            "exit_code": proc.returncode,
-            "stdout": self.scrub(cap(proc.stdout, limit), secrets_d, password),
-            "stderr": self.scrub(cap(proc.stderr, limit), secrets_d, password),
+            "exit_code": proc.returncode, "stdout": out, "stderr": err,
         })
+
+    def _send_page_result(self, p: PendingRequest, summary: dict) -> None:
+        """Push an E2EE execution summary to the approval page, sealed to
+        the page's ephemeral result key; the relay stores ciphertext only."""
+        ek = getattr(p, "result_ek", "")
+        if not ek or not self.cfg.get("report_results", True):
+            return
+        try:
+            import approve_client
+            ch = self.channel
+            if not ch or not ch.connected():
+                return
+            payload = approve_client.seal_payload(ek, summary)
+            ch.report(p.id, "done" if summary.get("exit_code") == 0
+                      else "error", payload=payload)
+        except Exception as exc:
+            log(f"{p.id}: page result push failed: {exc}")
 
     # -- "same command for N minutes" grants --------------------------------
 
@@ -855,7 +894,8 @@ class Daemon:
                             minutes = 1
                         self.store_grant(gkey, password, secrets_d, minutes,
                                          cmd)
-                    ch.report(p.id, "done")
+                    if not p.result_ek:
+                        ch.report(p.id, "done")  # legacy page, no results
                     return self.execute(
                         p, result, secrets_d,
                         approver=f"{cfg['approve_user']} via approve link "
@@ -927,6 +967,7 @@ class Daemon:
         scope = str(blob.get("scope") or "once")
         if not scope.startswith(("once", "same:")):
             scope = "once"
+        p.result_ek = str(blob.get("result_ek") or "")[:4096]
         return password, secrets_d, scope
 
     # -- legacy Matrix approval (fallback; approval only via 👍 from Matrix) --

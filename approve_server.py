@@ -47,7 +47,7 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "3.0"
+VERSION = "3.1"
 
 # --- WS opcode constants (RFC 6455 subset: text frames, ping/pong, close) ---
 OP_TEXT, OP_CLOSE, OP_PING, OP_PONG = 0x1, 0x8, 0x9, 0xA
@@ -65,6 +65,8 @@ DEFAULTS = {
     "max_token_hits": 60,
     "ping_interval_s": 30,
     "dead_after_s": 95,
+    "result_ttl_s": 900,
+    "exec_hold_s": 900,
 }
 
 
@@ -157,7 +159,7 @@ def ws_send_json(wfile, obj: dict, mask: bool = False) -> None:
 
 class Entry:
     __slots__ = ("rid", "token_hash", "meta", "pubkey", "created", "expires",
-                 "state", "hits", "attempts", "conn", "tombstone")
+                 "state", "hits", "attempts", "conn", "tombstone", "result")
 
     def __init__(self, rid, token_hash, meta, pubkey, ttl):
         self.rid = rid
@@ -171,6 +173,9 @@ class Entry:
         self.attempts = 0
         self.conn = None
         self.tombstone = 0.0
+        # opaque sealed result from the daemon ({ek,iv,ct}) — relay never
+        # sees its content, only stores and forwards it
+        self.result = None
 
 
 class Registry:
@@ -408,6 +413,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/v1/request/status":
             self.api_status()
             return
+        if path == "/api/v1/request/result":
+            self.api_result()
+            return
         self.send_generic_404()
 
     # ---- API: meta for the page -----------------------------------------
@@ -447,7 +455,19 @@ class Handler(BaseHTTPRequestHandler):
             self.send_generic_404()
             return
         self.send_json(200, {"state": state,
-                             "expires_in": max(0, int(e.expires - time.time()))})
+                             "expires_in": max(0, int(e.expires - time.time())),
+                             "has_result": bool(e.result)})
+
+    def api_result(self) -> None:
+        """Serve the sealed execution result (exit code + output) to the
+        page. The relay never sees the cleartext."""
+        token = self.bearer()
+        e, state = REGISTRY.find(token)
+        if e is None or not e.result:
+            self.send_generic_404()
+            return
+        log(f"result-served tok={short(e.token_hash)} rid={e.rid}")
+        self.send_json(200, {"state": state, **e.result})
 
     # ---- API: decision ----------------------------------------------------
 
@@ -671,18 +691,32 @@ def handle_revoke(conn: ClientConn, msg: dict) -> None:
 def handle_result(conn: ClientConn, msg: dict) -> None:
     rid = str(msg.get("id") or "")
     status = str(msg.get("status") or "?")[:40]
+    payload = msg.get("payload")
     with REGISTRY.lock:
         e = REGISTRY.by_rid.get(rid)
     if e is None or e.conn is not conn:
         return
-    if status == "auth_failed" and \
+    if status == "executing":
+        hold = float(REGISTRY.cfg.get("exec_hold_s", 900))
+        e.expires = max(e.expires, time.time() + hold)
+        log(f"executing rid={rid} hold=+{int(hold)}s")
+    elif status == "auth_failed" and \
             e.attempts < int(REGISTRY.cfg["max_attempts"]):
         with REGISTRY.lock:
             e.state = "auth_failed"
         log(f"auth-failed rid={rid} tok={short(e.token_hash)}")
     elif status in ("done", "denied", "cancelled", "error", "timeout"):
-        REGISTRY.drop(rid, "ok" if status == "done" else status)
-        log(f"result rid={rid} status={status}")
+        sealed = isinstance(payload, dict) and payload.get("ct")
+        if sealed:
+            e.result = {k: str(payload.get(k) or "")[:4096]
+                        for k in ("ek", "iv", "ct")}
+            REGISTRY.drop(rid, "ok" if status == "done" else status,
+                          tombstone_s=float(REGISTRY.cfg.get("result_ttl_s",
+                                                             900)))
+        else:
+            REGISTRY.drop(rid, "ok" if status == "done" else status)
+        log(f"result rid={rid} status={status}"
+            + (" sealed" if sealed else ""))
 
 
 def reaper() -> None:
@@ -746,6 +780,10 @@ PAGE = """<!doctype html>
   </section>
 
   <p id="status" role="status"></p>
+  <details id="resbox" hidden>
+    <summary id="ressum">Ergebnis</summary>
+    <pre id="resout"></pre>
+  </details>
 </main>
 <script src="/app.js"></script>
 </body>
@@ -781,6 +819,12 @@ button.danger { background: #3a405a; }
 #status.err { color: #ff8080; }
 #status.ok { color: #6de08a; }
 #secrethint { font-size: .85rem; color: #ffb86c; margin-top: 10px; }
+#resbox { margin-top: 14px; border: 1px solid #3a405a; border-radius: 8px;
+padding: 8px 12px; }
+#resbox summary { cursor: pointer; font-weight: 600; }
+#resout { white-space: pre-wrap; word-break: break-all; max-height: 420px;
+overflow: auto; font-size: .82rem; background: rgba(127,127,127,.12);
+padding: .6em .8em; border-radius: 6px; margin: .6em 0 0; }
 """
 
 APP_JS = """'use strict';
@@ -808,7 +852,8 @@ function stopTimers() { if (pollTimer) clearInterval(pollTimer);
   if (tickTimer) clearInterval(tickTimer); pollTimer = tickTimer = null; }
 
 function dead(msg) { stopTimers(); $('req').hidden = true;
-  $('hint').hidden = true; setStatus(msg, 'err'); }
+  $('hint').hidden = true; setStatus(msg, 'err');
+  showResult().catch(() => {}); }
 
 async function api(path, opts) {
   opts = opts || {}; opts.headers = Object.assign(
@@ -888,6 +933,17 @@ async function approve(ev) {
     const aesKey = await crypto.subtle.generateKey(
       { name: 'AES-GCM', length: 256 }, true, ['encrypt']);
     const iv = crypto.getRandomValues(new Uint8Array(12));
+    let result_ek = '';
+    try {
+      const rk = await crypto.subtle.generateKey(
+        { name: 'RSA-OAEP', modulusLength: 2048, hash: 'SHA-256',
+          publicExponent: new Uint8Array([1, 0, 1]) }, true,
+        ['encrypt', 'decrypt']);
+      result_ek = B64.bytesToB64(
+        await crypto.subtle.exportKey('spki', rk.publicKey));
+      localStorage.setItem('isudo_rk_' + token,
+        JSON.stringify(await crypto.subtle.exportKey('jwk', rk.privateKey)));
+    } catch (e) { /* result channel optional */ }
     const pw = $('pw').value;
     const secrets = {};
     document.querySelectorAll('#secrets input').forEach(i => {
@@ -895,7 +951,7 @@ async function approve(ev) {
     });
     const plain = new TextEncoder().encode(JSON.stringify(
       { v: 1, id: meta.id, password: pw, secrets, scope: $('scope').value,
-        ts: Math.floor(Date.now() / 1000) }));
+        result_ek: result_ek, ts: Math.floor(Date.now() / 1000) }));
     const ct = await crypto.subtle.encrypt(
       { name: 'AES-GCM', iv }, aesKey, plain);
     const raw = await crypto.subtle.exportKey('raw', aesKey);
@@ -926,21 +982,52 @@ async function denyPage() {
                    : 'Abgelehnt. Der Befehl wurde nicht ausgef\\u00fchrt.', 'ok');
 }
 
+async function showResult() {
+  const r = await api('/api/v1/request/result');
+  if (!r || r.gone || !r.ct) return;
+  $('resbox').hidden = false;
+  const enc = localStorage.getItem('isudo_rk_' + token);
+  if (!enc) { $('ressum').textContent =
+    'Ergebnis vorhanden \\u2014 zum Entschl\\u00fcsseln hier im Browser ' +
+    'freigeben (Schl\\u00fcssel liegt lokal).'; return; }
+  try {
+    const prv = await crypto.subtle.importKey('jwk', JSON.parse(enc),
+      { name: 'RSA-OAEP', hash: 'SHA-256' }, false, ['decrypt']);
+    const aesKey = await crypto.subtle.decrypt({ name: 'RSA-OAEP' }, prv,
+      B64.urlToBytes(r.ek));
+    const plain = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: B64.urlToBytes(r.iv) }, aesKey,
+      B64.urlToBytes(r.ct));
+    const d = JSON.parse(new TextDecoder().decode(plain));
+    $('ressum').textContent =
+      (d.status === 'done' ? 'Ausgef\\u00fchrt' : String(d.status || 'Beendet')) +
+      (d.exit_code === null || d.exit_code === undefined
+        ? '' : ' \\u00b7 exit ' + d.exit_code);
+    let txt = d.stdout || '';
+    if (d.stderr) txt += (txt ? '\\n' : '') + '[stderr]\\n' + d.stderr;
+    $('resout').textContent = txt || '(keine Ausgabe)';
+  } catch (e) {
+    $('ressum').textContent = 'Ergebnis konnte nicht entschl\\u00fcsselt ' +
+      'werden (anderer Browser?)';
+  }
+}
+
 function poll() {
   setStatus('Warte auf Ausf\\u00fchrung \\u2026');
+  if (tickTimer) { clearInterval(tickTimer); tickTimer = null; }
+  const finish = (msg) => { stopTimers(); $('req').hidden = true;
+    setStatus(msg, 'ok'); showResult().catch(() => {}); };
   pollTimer = setInterval(async () => {
     const r = await api('/api/v1/request/status');
-    if (r.gone) return dead('Anfrage nicht (mehr) g\\u00fcltig.');
-    if (r.state === 'ok') { stopTimers();
-      $('req').hidden = true;
-      setStatus('\\u2713 Ausgef\\u00fchrt.', 'ok'); }
+    if (r.gone) { stopTimers(); $('req').hidden = true;
+      setStatus('Anfrage nicht (mehr) g\\u00fcltig.', 'err');
+      showResult().catch(() => {}); return; }
+    if (r.state === 'ok') finish('\\u2713 Ausgef\\u00fchrt.');
     else if (r.state === 'auth_failed') {
       $('go').disabled = false; $('no').disabled = false;
       setStatus('Passwort falsch \\u2014 bitte erneut versuchen.', 'err'); }
     else if (r.state === 'denied') return dead('Abgelehnt.');
-    else if (r.state === 'done') { stopTimers();
-      $('req').hidden = true;
-      setStatus('\\u2713 Ausgef\\u00fchrt.', 'ok'); }
+    else if (r.state === 'done') finish('\\u2713 Ausgef\\u00fchrt.');
   }, 1500);
 }
 
