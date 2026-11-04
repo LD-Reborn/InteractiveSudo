@@ -395,11 +395,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/app.js":
             self._send(200, APP_JS.encode("utf-8"),
                        "text/javascript; charset=utf-8",
-                       {"Cache-Control": "public, max-age=300"})
+                       {"Cache-Control": "no-cache"})
             return
         if path == "/style.css":
             self._send(200, APP_CSS.encode("utf-8"), "text/css; charset=utf-8",
-                       {"Cache-Control": "public, max-age=300"})
+                       {"Cache-Control": "no-cache"})
             return
         if path == "/robots.txt":
             self._send(200, b"User-agent: *\nDisallow: /\n", "text/plain")
