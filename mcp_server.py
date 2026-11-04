@@ -177,20 +177,29 @@ def normalize_secret_names(names, argv: list[str] | None = None) -> list[str]:
 
 
 def verify_login_password(user: str, password: str) -> bool:
-    """Check a login password against shadow/PAM via chpasswd -c.
+    """Check a login password via pamtester (PAM service 'sudo').
 
     Runs as root only; the password goes through stdin (never argv, never
-    stored). Any nonzero exit or odd input is treated as "wrong".
+    stored). pamtester exits 0 on success, 2 on wrong password; anything
+    else (incl. missing libpam-tools) fails closed.
     """
     if not password or not user or len(password) > 1024:
         return False
     if any(c in password for c in "\n\r\x00") or any(
             c in user for c in "\n\r\x00:"):
         return False
+    exe = shutil.which("pamtester")
+    if not exe:
+        LOG.error("pamtester not found (install libpam-tools): cannot "
+                  "verify passwords — denying")
+        return False
     try:
         proc = subprocess.run(
-            ["chpasswd", "-c"], input=f"{user}:{password}\n",
+            [exe, "sudo", user, "authenticate"], input=password + "\n",
             capture_output=True, text=True, timeout=15, env=RUN_ENV)
+        if proc.returncode != 0:
+            LOG.info("pamtester denied login for %s (exit %d)",
+                     user, proc.returncode)
         return proc.returncode == 0
     except Exception:
         return False
