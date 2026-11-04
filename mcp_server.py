@@ -608,7 +608,7 @@ class Daemon:
         if getattr(p, "result_ek", ""):
             # page awaits the final result: extend its hold, then report
             try:
-                if self.channel and self.channel.connected():
+                if self.channel and self.channel.connected:
                     self.channel.report(p.id, "executing")
             except Exception:
                 pass
@@ -665,7 +665,7 @@ class Daemon:
         try:
             import approve_client
             ch = self.channel
-            if not ch or not ch.connected():
+            if not ch or not ch.connected:
                 return
             payload = approve_client.seal_payload(ek, summary)
             ch.report(p.id, "done" if summary.get("exit_code") == 0
