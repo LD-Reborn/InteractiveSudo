@@ -838,7 +838,8 @@ class Daemon:
                     verdict = self._consume_approval(p, key, ev, ch)
                     if verdict is None:
                         continue  # bad blob or wrong password — page retries
-                    if isinstance(verdict, tuple):
+                    if (isinstance(verdict, tuple) and len(verdict) == 2
+                            and verdict[0] == "denied"):
                         # ("denied", reason): crypto/identity failure
                         self.wh.send_notice(f"🚫 sudo {p.id} rejected: "
                                             f"{verdict[1]}")
