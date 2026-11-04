@@ -1,142 +1,171 @@
 # InteractiveSudoMCP
 
 Human-in-the-loop **root** for coding agents (e.g. OpenCode). The agent can
-never run a privileged command unattended: every `sudo_run` call is announced
-to you in Matrix, and only a **👍 from you** makes a root daemon execute it.
-No passwords anywhere, and no local approval channel — not even the agent
-itself can approve.
+never run a privileged command unattended: every `sudo_run` call produces a
+**single-use HTTPS approval link** and only clicking it **plus typing your
+password** makes the root daemon execute the command. The password travels
+end-to-end-encrypted; it appears nowhere else — not in chat, not in the
+agent's context, not in any log.
 
-## Architecture
+## Architecture (v3)
 
-One file (`mcp_server.py`), two roles:
-
-| Role | Runs as | What it does |
+| Part | Runs as | What it does |
 |---|---|---|
-| **Root daemon** (`daemon` subcommand, systemd) | `root` | Denylist check → Matrix announcement → waits for your 👍/👎 → executes as root → history. Stdlib-only. |
-| **MCP server** (`serve` subcommand, started by the agent) | you | Thin forwarder: sends requests to the daemon over a Unix socket, fires desktop notifications. No secrets, no privileges. |
+| **Root daemon** (`mcp_server.py daemon`, systemd) | root | Denylist → registers request with the relay over WSS (PSK) → posts a one-time link in Matrix → waits → decrypts the approval, verifies your password (`chpasswd -c`) → executes as root → history. |
+| **Approval relay** (`approve_server.py`, your public host) | non-root user, behind nginx/TLS | Blind relay: serves the approval page, forwards E2EE ciphertext to the daemon's open WSS. Cannot read passwords/secrets, keeps no state on disk. Stdlib-only. |
+| **MCP server** (`mcp_server.py serve`, started by the agent) | you | Thin forwarder over a Unix socket + desktop notifications. No secrets. |
 
 ```
-agent ── sudo_run(cmd, reason) ──▶ MCP server (you) ── Unix socket ──▶ root daemon
+agent ──sudo_run(cmd, reason, secret_vars)──▶ MCP forwarder ──unix sock──▶ root daemon
                                                                         │ 1. denylist (instant refusal)
-                                                                        │ 2. POST /webhook ──▶ your Matrix room
-                                                                        │    (client fires notify-send)
-                                                                        │ 3. wait for 👍/👎 — Matrix ONLY
-                                                                        │    └ remind_after_s: 🚨 mention ping
-                                                                        │ 4. client disconnected? → cancelled
+                                                                        │ 2. WSS register (PSK) + ephemeral RSA key
+                                                                        │    ◀── one-time token
+                                                                        │ 3. Matrix: "approval pending" + link
+                                                                        │    https://approve.host/#/r/<token>
+                                                                        │    (token = URL fragment → never in any log)
+   you ── open link ──▶ relay page ── GET meta (Bearer token) ────────────┤
+       reads command/reason/secrets, types password ──▶ RSA-OAEP+AES-GCM │ 4. relay forwards ciphertext
+                                                                        │    over the already-open WSS
+                                                                        │ 5. decrypt, chpasswd -c (shadow/PAM)
+                                                                        │ 6. run as root (argv, cwd=/, min env,
+                                                                        │    secrets injected, output scrubbed)
                                                                         ▼
-                                                                  approved?
-                                                                  ├─ no/expired → {ok:false, status:...}
-                                                                  └─ 👍 yes → run as root (argv, cwd=/, min env)
-                                                                            → {ok, exit_code, stdout, stderr}
+                                                              {ok, exit_code, stdout, stderr}
 ```
 
-## Why a root daemon instead of sudo + password?
+Approval is **two-factor**: possession of the single-use URL (registered
+only while pending, 256-bit token, TTL, single-use, rate limits) **and**
+knowledge of your login password. The Matrix channel is **deny-only**: 👎/no
+on the message aborts the request; 👍/yes never approves (that was the
+single-factor weakness this replaces).
 
-Passwords in chat are the problem this replaced: a `yes <password>` reply
-lands in the Matrix homeserver's history, on every synced device, and can
-leak into the agent's context. The daemon removes passwords entirely — and
-because the agent (running as you) has a shell, **local approval channels
-would be forgeable by a compromised account**. So approval comes only from
-Matrix, out-of-band from this machine.
+## Features
 
-Verified properties (live-tested):
-- 👍 reaction on the request/reminder message, or `yes`/`ja` text, approves;
-  👎/`no` denies; anything else is ignored.
-- The **bot's own 👍 is ignored** — a local process cannot self-approve.
-- Closing the connection (agent gave up) **cancels** the request.
-- `cancel last` from a terminal cancels a pending request.
+- **Named secrets as variables** — `sudo_run(secret_vars=["GIT_TOKEN"])`
+  (or `$GIT_TOKEN` inside the command, auto-detected) shows a field on the
+  approval page; the value is encrypted in the browser (WebCrypto),
+  injected into the command's environment at exec time only, scrubbed from
+  stdout/stderr, and never visible to the agent or the relay.
+- **Scope dropdown** — "Nur dieses eine Mal" (default) or "Diesen Befehl
+  nochmal für N Minuten" (grant stays in root RAM, listed by `sudo_status`,
+  revocable with `revoke`). There is deliberately **no** "allow all".
+- **Denylist** substrings are refused before anyone is even asked.
+- **Legacy pure-Matrix mode** still works when `approve_url` is empty;
+  `fallback_matrix_approve: true` uses it when the relay is unreachable.
+- **Client-initiated everything**: the PC needs no inbound port or cert —
+  it dials out to your existing nginx/TLS host.
 
 ## Tools (MCP, stdio)
 
 | Tool | What it does |
 |---|---|
-| `sudo_run(command, reason, timeout_s?)` | Announces in Matrix, waits for 👍/👎, runs as root on approval, returns `ok`, `exit_code`, `stdout`, `stderr`. |
-| `sudo_status()` | Daemon health, bot/room, pending requests, recent history. |
+| `sudo_run(command, reason, timeout_s?, secret_vars?)` | Ask for approval, then run as root. Returns `ok`, `exit_code`, `stdout`, `stderr` (secrets scrubbed). |
+| `sudo_status()` | Daemon health, relay connection, active grants, pending, history. |
 
-`command` is preferably an argv list (`["apt", "install", "foo"]`); a shell
-string is also accepted (runs through `sh -c` — you approve exactly that string).
-
-## Approving
-
-React **👍** on the request message (or the 🚨 reminder) to approve,
-**👎** to deny — or reply in the room: `yes`/`ja`/`ok` … approve,
-`no`/`nein`/`abort` … deny. Nothing else counts. If nobody decides within
-`wait_timeout_s` (default 600s) the request expires; at `remind_after_s`
-(default 300s) the bot sends a **mention** (pushes your phone) and the
-desktop notification re-fires.
-
-CLI (user side, no approval possible by design):
+CLI (user side; approval is never possible from the CLI by design):
 
 ```sh
-python3 mcp_server.py status          # daemon health + pending + history
+python3 mcp_server.py status          # daemon + relay + grants + recent
 python3 mcp_server.py history -n 10   # recent completed requests
 python3 mcp_server.py cancel last     # cancel a pending request
+python3 mcp_server.py revoke list     # active "same command" grants
+python3 mcp_server.py revoke all      # revoke them
 ```
 
-## Install (human sudo action — do not let the agent run this)
+## Install
+
+**1) The relay** (once, on your public Linux host; needs root there):
+deploy `approve_server.py` behind nginx with a TLS cert, e.g.
+
+```ini
+# /etc/approved/config.json  (0640, psk = shared with the daemon)
+{"bind": "127.0.0.1", "port": 8095, "psk": "<32+ byte secret>",
+ "ttl_s": 300, "same_cmd_minutes": 10, "max_attempts": 3,
+ "page_title": "approve.example.com"}
+```
+
+nginx: `location / { proxy_pass http://127.0.0.1:8095; proxy_http_version 1.1;
+proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade";
+proxy_read_timeout 3600; }` — see `make_local_deploy.py` for a complete
+example installer (systemd unit, DNS record, certbot, vhost).
+
+**2) The daemon** (this machine — deliberate HUMAN sudo action):
 
 ```sh
 cd ~/.config/InteractiveSudo
+echo -n '<the same PSK>' > secrets/approve_psk   # chmod 600; removed from /etc
 ./install.sh
 ```
 
-`install.sh` deploys:
+`install.sh` deploys the daemon code root-owned to
+`/usr/local/lib/interactivesudo/`, creates `/etc/interactivesudo/`
+(config.json 0640, api_key + approve_psk 0600 — kept on re-runs) and
+(installs and restarts) the systemd unit.
 
-- `/usr/local/lib/interactivesudo/mcp_server.py` — daemon code, **root-owned**
-  (a user-writable daemon would be an escalation path: edit code, wait for
-  restart → root runs your code). Edit in `~/.config/InteractiveSudo/` and
-  re-run `install.sh` to deploy.
-- `/etc/interactivesudo/config.json` (0640 root) and
-  `/etc/interactivesudo/api_key` (0600 root) — created once, then preserved.
-- `/etc/systemd/system/interactivesudo.service` — enabled, started.
+**3) Enable URL approval** in `/etc/interactivesudo/config.json`:
 
-Check: `systemctl status interactivesudo`, `journalctl -u interactivesudo -f`,
-then `python3 mcp_server.py status`.
+```json
+"approve_url": "wss://approve.example.com/ws/v1/client",
+"approve_psk_file": "/etc/interactivesudo/approve_psk",
+"approve_user": "yourlogin"
+```
 
-**Important:** never keep `secrets/api_key` inside a synced or backed-up
-folder (cloud sync pushes it to servers and all your devices). `install.sh`
-imports it to `/etc` and tells you to delete the project copy — and you
-should **rotate the key** in MatrixWebhooker afterwards.
+**Important:** never keep `secrets/*` inside a synced/backed-up folder.
+`install.sh` imports them to `/etc` and tells you to delete the copies;
+rotate anything that ever landed in a chat.
 
-## Configuration
-
-Daemon (`/etc/interactivesudo/config.json`, see `daemon_config.example.json`):
+## Configuration (daemon, `/etc/interactivesudo/config.json`)
 
 | Key | Default | Meaning |
 |---|---|---|
 | `webhooker_url` | `http://localhost:8080` | MatrixWebhooker base URL |
 | `api_key_file` | `/etc/interactivesudo/api_key` | bot API key (root-only) |
-| `socket_path` | `/run/interactivesudo/agent.sock` | daemon socket (0660, group `socket_group`) |
-| `socket_group` | your username | group allowed to submit requests |
+| `approve_url` | *(empty = legacy mode)* | relay WSS endpoint |
+| `approve_psk_file` | `/etc/interactivesudo/approve_psk` | registration key (root-only) |
+| `approve_user` | `operator` | account whose password approves |
+| `approve_ttl_s` | `300` | link lifetime / wait deadline |
+| `approve_remind_s` | `180` | Matrix mention ping (`0` = off) |
+| `fallback_matrix_approve` | `false` | legacy 👍 if relay down |
+| `socket_path` / `socket_group` | `/run/interactivesudo/agent.sock` | daemon socket |
 | `state_dir` | `/var/lib/interactivesudo` | history (root-only) |
-| `wait_timeout_s` | `600` | how long to wait for 👍/👎 |
-| `remind_after_s` | `300` | mention ping after this long (`0` = off) |
-| `remind_mxid` | your MXID | mentioned so the ping pushes |
+| `wait_timeout_s` / `remind_after_s` | `600` / `300` | legacy-mode timing |
 | `command_timeout_s` | `300` | max runtime of the command |
 | `max_pending` | `5` | refuse new requests beyond this |
 | `denylist` | see file | substrings refused without asking |
 
-Client (`config.json` next to `mcp_server.py`): `socket_path`, `desktop_notify`.
-Env overrides: `SUDOMCP_CONFIG` (client), `SUDOMCP_DAEMON_CONFIG` (daemon).
+Client (`config.json` next to `mcp_server.py`): `socket_path`,
+`desktop_notify`. Env overrides: `SUDOMCP_CONFIG`, `SUDOMCP_DAEMON_CONFIG`.
 
 ## Security model
 
-- **Approval only via Matrix** from your account; the bot's own messages are
-  ignored. No decision files, no CLI approve — a compromised user account
-  (or the agent) cannot self-approve.
-- **Root-owned daemon code + key**; deployment is a deliberate human sudo
-  (`install.sh`).
-- **Denylist** substrings are refused instantly without asking.
-- Commands run as root with a minimal environment, `cwd=/`, and a timeout.
-- Client disconnect ⇒ request cancelled before execution.
-- History (`/var/lib/interactivesudo/history.jsonl`, 0600) records command,
-  reason, approver, exit code.
-- Trust anchor: your Matrix account + homeserver. If the homeserver is
-  compromised, an attacker can send 👍 — keep E2EE/offline-key hygiene.
+- Approval = one-time URL (possession) **and** your password (knowledge),
+  verified against shadow/PAM via `chpasswd -c` inside the root daemon.
+- Password + named secrets: per-request ephemeral RSA-2048 keypair, browser
+  encrypts (WebCrypto RSA-OAEP + AES-256-GCM); the relay only ever handles
+  opaque ciphertext; nothing touches disk or logs; output is scrubbed.
+- The token lives in the URL **fragment** — browsers never send fragments,
+  so nginx access logs, `Referer` and Matrix link-preview crawlers cannot
+  see it. The page strips it from the address bar after loading.
+- GET only displays (safe for unfurlers); POST decides; single-use tokens;
+  attempts/rate limits; generic 404s; only truncated token hashes in logs.
+- Registration with the relay requires the PSK (root-only file) — nobody
+  else can inject approval pages.
+- No local approval channel: the bot's own messages are ignored; a
+  compromised user account cannot approve or (without the password)
+  escalate. Denylist still applies to every path, including grants.
+- Commands run as root with a minimal environment, `cwd=/`, timeout;
+  client disconnect or 👎 cancels before execution.
+- Trust anchors: your password, the PSK, the relay host's TLS, and your
+  Matrix account (for the deny path). A compromised relay can at most
+  refuse/serve stale pages — it cannot forge an approval (no PSK-authorized
+  channel ⇒ nowhere to deliver a payload) and cannot read any secret.
 
 ## Notes
 
-- The MCP server (user-side) needs the venv (`mcp` package); the daemon is
-  stdlib-only and runs on the system python.
-- A command that reads stdin gets EOF (captured output, no tty).
+- The daemon needs `python3-cryptography` (apt) and `approve_client.py`
+  beside it; the relay is stdlib-only (Python ≥ 3.10).
+- The password must be the daemon user's actual login password; password
+  policies/lockouts (`pam_faillock`) apply to failed attempts.
 - Registered in `~/.config/opencode/opencode.json` under `mcp.servers.sudo`.
+- Tests: `python3 test_e2e_local.py` (relay + channel + E2EE + page-API
+  parity through Node's WebCrypto) — no network, uses 127.0.0.1 only.

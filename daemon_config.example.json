@@ -12,6 +12,12 @@
   "command_timeout_s": 300,
   "max_output_chars": 20000,
   "max_pending": 5,
+  "approve_url": "wss://approve.example.com/ws/v1/client",
+  "approve_psk_file": "/etc/interactivesudo/approve_psk",
+  "approve_user": "operator",
+  "approve_ttl_s": 300,
+  "approve_remind_s": 180,
+  "fallback_matrix_approve": false,
   "denylist": [
     "mkfs",
     "dd if=",

@@ -8,6 +8,7 @@ test -f "$DIR/mcp_server.py" || { echo "run from the project dir"; exit 1; }
 echo "→ deploying daemon code (root-owned, so the agent cannot tamper with it)"
 sudo install -d -m 0755 /usr/local/lib/interactivesudo
 sudo install -m 0755 "$DIR/mcp_server.py" /usr/local/lib/interactivesudo/mcp_server.py
+sudo install -m 0755 "$DIR/approve_client.py" /usr/local/lib/interactivesudo/approve_client.py
 
 echo "→ config + api key in /etc/interactivesudo (created once, then preserved)"
 sudo install -d -m 0750 /etc/interactivesudo
@@ -28,6 +29,11 @@ if [ ! -f /etc/interactivesudo/api_key ]; then
 fi
 
 echo "→ systemd unit"
+if [ -f "$DIR/secrets/approve_psk" ]; then
+  sudo install -m 0600 "$DIR/secrets/approve_psk" /etc/interactivesudo/approve_psk
+  echo "  imported secrets/approve_psk → /etc/interactivesudo/approve_psk"
+  echo "  now DELETE the project copy: rm secrets/approve_psk"
+fi
 sudo install -m 0644 "$DIR/interactivesudo.service" /etc/systemd/system/interactivesudo.service
 sudo systemctl daemon-reload
 sudo systemctl enable interactivesudo
