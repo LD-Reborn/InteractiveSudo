@@ -10,6 +10,17 @@ sudo install -d -m 0755 /usr/local/lib/interactivesudo
 sudo install -m 0755 "$DIR/mcp_server.py" /usr/local/lib/interactivesudo/mcp_server.py
 sudo install -m 0755 "$DIR/approve_client.py" /usr/local/lib/interactivesudo/approve_client.py
 
+echo "→ password verifier (small PAM helper, compiled from pam_check.c)"
+if command -v gcc >/dev/null 2>&1 && [ -f /usr/include/security/pam_appl.h ]; then
+  sudo gcc -O2 -Wall -o /usr/local/lib/interactivesudo/pam_check "$DIR/pam_check.c" -lpam
+  sudo chmod 0755 /usr/local/lib/interactivesudo/pam_check
+  echo "  built pam_check"
+else
+  echo "  !! need gcc + libpam-dev to build pam_check — install then re-run:"
+  echo "     sudo apt-get install -y gcc libpam-dev"
+  exit 1
+fi
+
 echo "→ config + api key in /etc/interactivesudo (created once, then preserved)"
 sudo install -d -m 0750 /etc/interactivesudo
 if [ ! -f /etc/interactivesudo/config.json ]; then
