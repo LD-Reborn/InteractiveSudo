@@ -86,7 +86,7 @@ deploy `approve_server.py` behind nginx with a TLS cert, e.g.
 
 nginx: `location / { proxy_pass http://127.0.0.1:8095; proxy_http_version 1.1;
 proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade";
-proxy_read_timeout 3600; }` — see `make_local_deploy.py` for a complete
+proxy_read_timeout 3600; }` — see the relay docs in `approve_server.py` for a complete
 example installer (systemd unit, DNS record, certbot, vhost).
 
 **2) The daemon** (this machine — deliberate HUMAN sudo action):
