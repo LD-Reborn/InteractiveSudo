@@ -4,4 +4,4 @@ __pycache__/
 *.pyc
 
 # personal deployment generator for private infra — keep out of the public repo
-make_local_deploy.py
+make_*_deploy.py
