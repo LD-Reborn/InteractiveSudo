@@ -993,8 +993,10 @@ async function showResult() {
   try {
     const prv = await crypto.subtle.importKey('jwk', JSON.parse(enc),
       { name: 'RSA-OAEP', hash: 'SHA-256' }, false, ['decrypt']);
-    const aesKey = await crypto.subtle.decrypt({ name: 'RSA-OAEP' }, prv,
+    const aesRaw = await crypto.subtle.decrypt({ name: 'RSA-OAEP' }, prv,
       B64.urlToBytes(r.ek));
+    const aesKey = await crypto.subtle.importKey('raw', aesRaw,
+      { name: 'AES-GCM' }, false, ['decrypt']);
     const plain = await crypto.subtle.decrypt(
       { name: 'AES-GCM', iv: B64.urlToBytes(r.iv) }, aesKey,
       B64.urlToBytes(r.ct));

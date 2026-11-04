@@ -227,6 +227,24 @@ def main() -> int:
     check("result roundtrip (exit+stdout)",
           d.get("exit_code") == 0 and "hello ergebnis" in d.get("stdout", ""))
 
+    # browser parity: exactly the showResult()/approve() WebCrypto calls
+    if shutil_node():
+        gen = subprocess.run(["node", os.path.join(HERE, "test_result_parity.mjs"),
+                              "gen"], capture_output=True, text=True, timeout=30)
+        check("result parity: gen", gen.returncode == 0, gen.stderr[:120])
+        pair = json.loads(gen.stdout)
+        sealed2 = seal_payload(pair["spki"], summary)
+        op = subprocess.run(
+            ["node", os.path.join(HERE, "test_result_parity.mjs"), "open",
+             json.dumps(pair["jwk"]), json.dumps(sealed2)],
+            capture_output=True, text=True, timeout=30)
+        try:
+            d2 = json.loads(op.stdout)
+        except Exception:
+            d2 = {}
+        check("browser decrypts sealed result (node WebCrypto)",
+              op.returncode == 0 and d2 == summary, op.stderr[:120])
+
     print("== 6. expiry ==")
     url4, _ = ch.register("s-e2e-4", "sleep 999", "expiry test", [], 300)
     tok4 = url4.split("/r/")[1]
