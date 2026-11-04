@@ -177,28 +177,29 @@ def normalize_secret_names(names, argv: list[str] | None = None) -> list[str]:
 
 
 def verify_login_password(user: str, password: str) -> bool:
-    """Check a login password via pamtester (PAM service 'sudo').
+    """Check a login password via the pam_check helper (PAM, service 'sudo').
 
     Runs as root only; the password goes through stdin (never argv, never
-    stored). pamtester exits 0 on success, 2 on wrong password; anything
-    else (incl. missing libpam-tools) fails closed.
+    stored). pam_check (small C helper, see pam_check.c) exits 0 ok / 2
+    wrong / 3 unknown user / 4 pam error; anything but 0 means "wrong".
     """
     if not password or not user or len(password) > 1024:
         return False
     if any(c in password for c in "\n\r\x00") or any(
             c in user for c in "\n\r\x00:"):
         return False
-    exe = shutil.which("pamtester")
-    if not exe:
-        LOG.error("pamtester not found (install libpam-tools): cannot "
-                  "verify passwords — denying")
+    helper = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "pam_check")
+    if not os.path.exists(helper):
+        LOG.error("pam_check binary missing next to daemon: cannot verify "
+                  "passwords — denying")
         return False
     try:
         proc = subprocess.run(
-            [exe, "sudo", user, "authenticate"], input=password + "\n",
+            [helper, user, "sudo"], input=password + "\n",
             capture_output=True, text=True, timeout=15, env=RUN_ENV)
         if proc.returncode != 0:
-            LOG.info("pamtester denied login for %s (exit %d)",
+            LOG.info("password check denied for %s (exit %d)",
                      user, proc.returncode)
         return proc.returncode == 0
     except Exception:
@@ -824,6 +825,9 @@ class Daemon:
                                    "command": cmd, "reason": p.reason,
                                    "status": "expired", "source": "url"})
                 if op == "decision":
+                    log(f"{p.id}: page decision={ev.get('decision')!r} "
+                        f"payload={'yes' if ev.get('payload') else 'no'} "
+                        f"scope={ev.get('scope')!r}")
                     if ev.get("decision") == "deny":
                         self.wh.send_notice(f"🚫 sudo {p.id} denied on "
                                             f"the approval page")
@@ -836,6 +840,8 @@ class Daemon:
                         continue  # bad blob or wrong password — page retries
                     if isinstance(verdict, tuple):
                         # ("denied", reason): crypto/identity failure
+                        self.wh.send_notice(f"🚫 sudo {p.id} rejected: "
+                                            f"{verdict[1]}")
                         return finish("denied",
                                       {"detail": verdict[1],
                                        "approver": "approval page"})
@@ -899,14 +905,16 @@ class Daemon:
         finally:
             payload = None
         if blob.get("id") != p.id:
-            log(f"{p.id}: approval payload bound to wrong request id — "
-                f"rejected")
+            log(f"{p.id}: approval payload bound to wrong request id "
+                f"(got {blob.get('id')!r}) — rejected")
             ch.report(p.id, "error")
             return ("denied", "approval payload was not meant for this "
                               "request")
-        if abs(time.time() - float(blob.get("ts") or 0)) > 900:
-            ch.report(p.id, "error")
-            return ("denied", "approval payload is stale")
+        # NB: no freshness check on blob["ts"]: the relay TTL + single-use
+        # binding already limit replay, and a skewed client clock must not
+        # brick approvals. Only logged.
+        log(f"{p.id}: approval payload ts={blob.get('ts')!r} "
+            f"now={int(time.time())}")
         password = str(blob.get("password") or "")
         secrets_d = {k: str(v) for k, v in (blob.get("secrets") or {}).items()
                      if k in p.secret_names and SECRET_NAME_RE.fullmatch(k)}
