@@ -816,7 +816,9 @@ button { flex: 1; padding: 12px; border-radius: 10px; border: 0;
 button:disabled { opacity: .5; cursor: wait; }
 button.danger { background: #3a405a; }
 #status { min-height: 1.4em; margin: 16px 0 0; font-weight: 600; }
-#status.err { color: #ff8080; }
+#status.err { color: #ff9a9a; background: rgba(255,90,90,.15);
+border: 1px solid rgba(255,110,110,.55); border-radius: 8px;
+padding: 8px 10px; }
 #status.ok { color: #6de08a; }
 #secrethint { font-size: .85rem; color: #ffb86c; margin-top: 10px; }
 #resbox { margin-top: 14px; border: 1px solid #3a405a; border-radius: 8px;
@@ -846,7 +848,8 @@ const B64 = {
 let token = null, meta = null, pollTimer = null, tickTimer = null;
 
 function setStatus(msg, cls) { const el = $('status');
-  el.textContent = msg || ''; el.className = cls || ''; }
+  el.textContent = msg || ''; el.className = cls || '';
+  if (cls === 'err') el.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }
 
 function stopTimers() { if (pollTimer) clearInterval(pollTimer);
   if (tickTimer) clearInterval(tickTimer); pollTimer = tickTimer = null; }
@@ -1027,6 +1030,8 @@ function poll() {
     if (r.state === 'ok') finish('\\u2713 Ausgef\\u00fchrt.');
     else if (r.state === 'auth_failed') {
       $('go').disabled = false; $('no').disabled = false;
+      if (document.activeElement !== $('pw')) {
+        $('pw').focus({ preventScroll: true }); $('pw').select(); }
       setStatus('Passwort falsch \\u2014 bitte erneut versuchen.', 'err'); }
     else if (r.state === 'denied') return dead('Abgelehnt.');
     else if (r.state === 'done') finish('\\u2713 Ausgef\\u00fchrt.');
