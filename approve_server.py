@@ -765,6 +765,10 @@ PAGE = """<!doctype html>
     <p id="reason"></p>
     <div id="secrethint"></div>
     <form id="form" autocomplete="off">
+      <div id="errbox" class="errbox" hidden>
+        <span id="errtxt"></span>
+        <button id="errclose" type="button" aria-label="schlie&szlig;en">&times;</button>
+      </div>
       <label>Sudo-Passwort
         <input id="pw" type="password" autocomplete="new-password" required>
       </label>
@@ -820,6 +824,12 @@ button.danger { background: #3a405a; }
 border: 1px solid rgba(255,110,110,.55); border-radius: 8px;
 padding: 8px 10px; }
 #status.ok { color: #6de08a; }
+.errbox { display: flex; justify-content: space-between; align-items: center;
+gap: 8px; background: rgba(255,90,90,.15); border: 1px solid
+rgba(255,110,110,.55); border-radius: 8px; padding: 8px 10px;
+margin: 0 0 12px; color: #ff9a9a; font-weight: 600; }
+.errbox button { background: none; border: none; color: inherit;
+font-size: 1.25em; line-height: 1; padding: 0 4px; cursor: pointer; }
 #secrethint { font-size: .85rem; color: #ffb86c; margin-top: 10px; }
 #resbox { margin-top: 14px; border: 1px solid #3a405a; border-radius: 8px;
 padding: 8px 12px; }
@@ -850,6 +860,12 @@ let token = null, meta = null, pollTimer = null, tickTimer = null;
 function setStatus(msg, cls) { const el = $('status');
   el.textContent = msg || ''; el.className = cls || '';
   if (cls === 'err') el.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }
+
+function showFormErr(msg) { const b = $('errbox');
+  $('errtxt').textContent = msg; b.hidden = false;
+  b.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }
+function clearFormErr() { $('errbox').hidden = true; }
+$('errclose').onclick = clearFormErr;
 
 function stopTimers() { if (pollTimer) clearInterval(pollTimer);
   if (tickTimer) clearInterval(tickTimer); pollTimer = tickTimer = null; }
@@ -927,6 +943,7 @@ async function load() {
 
 async function approve(ev) {
   ev.preventDefault();
+  clearFormErr();
   $('go').disabled = true; $('no').disabled = true;
   setStatus('Verschl\\u00fcssele \\u2026');
   try {
@@ -971,7 +988,7 @@ async function approve(ev) {
       return dead('Zu viele Fehlversuche \\u2014 Anfrage beendet.');
     poll();
   } catch (e) {
-    setStatus('Fehler: ' + e, 'err');
+    showFormErr('Fehler: ' + e);
     $('go').disabled = false; $('no').disabled = false;
   }
 }
@@ -1032,7 +1049,7 @@ function poll() {
       $('go').disabled = false; $('no').disabled = false;
       if (document.activeElement !== $('pw')) {
         $('pw').focus({ preventScroll: true }); $('pw').select(); }
-      setStatus('Passwort falsch \\u2014 bitte erneut versuchen.', 'err'); }
+      showFormErr('Passwort falsch \\u2014 bitte erneut versuchen.'); }
     else if (r.state === 'denied') return dead('Abgelehnt.');
     else if (r.state === 'done') finish('\\u2713 Ausgef\\u00fchrt.');
   }, 1500);
