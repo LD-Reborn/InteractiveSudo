@@ -828,6 +828,7 @@ padding: 8px 10px; }
 gap: 8px; background: rgba(255,90,90,.15); border: 1px solid
 rgba(255,110,110,.55); border-radius: 8px; padding: 8px 10px;
 margin: 0 0 12px; color: #ff9a9a; font-weight: 600; }
+.errbox[hidden] { display: none; }
 .errbox button { background: none; border: none; color: inherit;
 font-size: 1.25em; line-height: 1; padding: 0 4px; cursor: pointer; }
 #secrethint { font-size: .85rem; color: #ffb86c; margin-top: 10px; }
@@ -1003,6 +1004,7 @@ async function denyPage() {
 }
 
 async function showResult() {
+  if (showResult.done) return; showResult.done = true;
   const r = await api('/api/v1/request/result');
   if (!r || r.gone || !r.ct) return;
   $('resbox').hidden = false;
